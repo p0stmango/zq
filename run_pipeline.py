@@ -255,8 +255,11 @@ def run(cfg: PipelineConfig, x0: np.ndarray,
     print(f"clean    : {target.transcribe(x0, cfg.sr).text!r}\n")
 
     # Stage 2: zero-query generation
+    if cfg.mode == "real":
+        cfg.zq.log_every = min(cfg.zq.log_every, 10)   # feedback sooner on slow runs
     delta, _ = zq_sequential_optimize(x0, ensemble, cfg.target_text, cfg.zq,
-                                      target_audio=tgt_audio, sr=cfg.sr)
+                                      target_audio=tgt_audio, sr=cfg.sr,
+                                      verbose=(cfg.mode == "real"))
     r_zq = evaluate_transfer(x0, delta, build_target(cfg, target_centroids),
                              cfg.target_text, cfg.source_lang, cfg.fitness, cfg.sr)
     print(f"[stage 2: ZERO-QUERY ZQ]     adv={r_zq['adv_text']!r}  "
