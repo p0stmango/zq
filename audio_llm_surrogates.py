@@ -129,9 +129,12 @@ class Qwen2AudioSurrogate(AudioLLMSurrogate):
         torch = self.torch
         mel = torch.clamp(self.melspec(wav), min=1e-10).log10()
         mel = ((torch.maximum(mel, mel.max() - 8.0) + 4.0) / 4.0)
-        # Encoder + projector submodule names vary by version; commonly:
-        enc = self.model.audio_tower(mel.unsqueeze(0)).last_hidden_state
-        return self.model.multi_modal_projector(enc)[0]      # [T_a, d]
+        # Confirmed via introspect() on current transformers: audio_tower and
+        # multi_modal_projector are nested under .model. (Older versions expose
+        # them at the top level -> use self.model.audio_tower instead.)
+        core = self.model.model
+        enc = core.audio_tower(mel.unsqueeze(0)).last_hidden_state
+        return core.multi_modal_projector(enc)[0]            # [T_a, d]
 
     def _assemble(self, target_text, n_audio_tokens):
         torch = self.torch
