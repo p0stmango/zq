@@ -1,0 +1,17 @@
+# Core (offline toy pipeline needs only numpy)
+numpy
+
+# --- Real-mode deps ---
+# IMPORTANT: install torch + torchaudio from the CUDA index, NOT plain pip,
+# or you get the CPU build. See setup notes; example:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+torch
+torchaudio
+
+transformers>=4.45
+accelerate
+huggingface_hub
+
+openai            # target (gpt-transcribe) + sibling (gpt-4o-transcribe) oracles
+soundfile         # wav I/O  (also: sudo apt install libsndfile1 ffmpeg)
+jiwer             # real WER/CER scoring (swap in for the toy cer())
