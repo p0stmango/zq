@@ -160,19 +160,26 @@ class PipelineConfig:
 
 def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
     if cfg.mode == "real":
+        import time
         from zq_attack_gpt_transcribe import WhisperSurrogate
         from audio_llm_surrogates import (
             Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate)
-        # Weighted toward audio-LLMs (gpt-transcribe's family: Whisper-style
-        # encoder -> decoder-only LLM), with one Whisper for cheap diversity.
-        # Trim to fit VRAM -- see notes. Run introspect_model() + verify_surrogate.py
-        # on each before a full run.
-        return [
-            Qwen2AudioSurrogate("Qwen/Qwen2-Audio-7B-Instruct", device="cuda"),
-            VoxtralSurrogate("mistralai/Voxtral-Mini-3B-2507", device="cuda"),
-            # Qwen25OmniSurrogate("Qwen/Qwen2.5-Omni-7B", device="cuda"),  # heavier
-            WhisperSurrogate("openai/whisper-medium", language=cfg.source_lang, device="cuda"),
-        ]
+
+        def _load(desc, fn):
+            print(f"[load] {desc} ...", flush=True)
+            t = time.time(); s = fn()
+            print(f"[load] {desc} ready ({time.time()-t:.0f}s)", flush=True)
+            return s
+
+        # Multi-surrogate ensemble. Each must pass verify_surrogate.py first.
+        ens = []
+        ens.append(_load("Qwen2-Audio-7B", lambda: Qwen2AudioSurrogate(
+            "Qwen/Qwen2-Audio-7B-Instruct", device="cuda")))
+        ens.append(_load("Voxtral-Mini-3B", lambda: VoxtralSurrogate(
+            "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
+        ens.append(_load("Whisper-medium", lambda: WhisperSurrogate(
+            "openai/whisper-medium", language=cfg.source_lang, device="cuda")))
+        return ens
     base = np.linspace(-1.0, 1.0, len(cfg.alphabet))
     return [
         ToySurrogate("whisper_like_A", cfg.alphabet, base, jitter=0.03, seed=1),
@@ -239,6 +246,8 @@ def run(cfg: PipelineConfig, x0: np.ndarray,
     ensemble = build_ensemble(cfg)
     target = build_target(cfg, target_centroids)
     score_oracle = build_score_oracle(cfg, sibling_centroids)
+    if cfg.mode == "real":
+        print("[build] rendering target audio via TTS ...", flush=True)
     tgt_audio = build_target_audio(cfg, len(x0))
 
     print(f"ensemble : {[s.name for s in ensemble]}")
