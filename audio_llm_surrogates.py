@@ -66,6 +66,26 @@ class AudioLLMSurrogate(WhiteBoxSurrogate):
         out.loss.backward()                                 # step 6
         return float(out.loss.item()), wav.grad.detach().cpu().numpy()
 
+    def decode_teacher_forced(self, waveform: np.ndarray, target_text: str) -> str:
+        """Debug view: what the surrogate predicts at the transcript positions
+        given the current audio. Reuses the same forward as loss_grad (no
+        backward). NB this is TEACHER-FORCED -- each position sees the correct
+        previous target tokens -- so it's optimistic vs a free-running decode,
+        but it tracks convergence: as the loss falls, this should approach the
+        target string."""
+        torch = self.torch
+        with torch.no_grad():
+            wav = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            audio_embeds = self._audio_embeds(wav)
+            input_ids, audio_slice, labels = self._assemble(target_text,
+                                                            audio_embeds.shape[0])
+            emb = self.embed_tokens(input_ids).clone()
+            emb[audio_slice] = audio_embeds
+            logits = self.model(inputs_embeds=emb.unsqueeze(0)).logits[0]  # [L, V]
+            resp = (labels != -100).nonzero(as_tuple=True)[0]
+            pred = logits[resp - 1].argmax(-1)             # logit t-1 predicts token t
+            return self.processor.tokenizer.decode(pred, skip_special_tokens=True)
+
     # ---- per-model hooks -----------------------------------------------------
     def _audio_embeds(self, wav):
         """Differentiable: waveform -> [T_a, d] audio embeddings. Call the
