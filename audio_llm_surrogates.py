@@ -253,12 +253,18 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         return self.model.get_input_embeddings()(input_ids)
 
     def _audio_embeds(self, wav):
-        mel = self._whisper_log_mel(self.torch, wav, self.model.dtype)
-        # CONFIRM these two paths + AUDIO_TOKEN via introspect_model() on Voxtral,
-        # then verify_surrogate.py --model voxtral. Likely nested under .model.
+        torch = self.torch
+        mel = self._whisper_log_mel(torch, wav, self.model.dtype)
         core = getattr(self.model, "model", self.model)
-        enc = core.audio_tower(mel.unsqueeze(0)).last_hidden_state
-        return core.multi_modal_projector(enc)[0]
+        enc = core.audio_tower(mel.unsqueeze(0)).last_hidden_state    # (1, T, D)
+        # Voxtral's projector consumes frames STACKED by k (linear_1.in_features
+        # = D*k); concatenate k adjacent encoder frames before projecting.
+        proj = core.multi_modal_projector
+        b, t, d = enc.shape
+        k = proj.linear_1.in_features // d                           # Voxtral: 4
+        t2 = (t // k) * k
+        enc = enc[:, :t2, :].reshape(b, t2 // k, d * k)              # (1, T/k, D*k)
+        return proj(enc)[0]                                          # (T/k, d_llm)
 
     def _assemble(self, target_text, n_audio_tokens):
         return self._assemble_chat(self.processor.tokenizer, self.PRE, self.POST,
