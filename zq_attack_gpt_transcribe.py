@@ -187,6 +187,20 @@ class WhisperSurrogate(WhiteBoxSurrogate):
         loss.backward()
         return float(loss.item()), wav.grad.detach().cpu().numpy()
 
+    def decode_teacher_forced(self, waveform: np.ndarray, target_text: str) -> str:
+        """Debug view (teacher-forced) -- tracks convergence toward the target."""
+        torch = self.torch
+        with torch.no_grad():
+            wav = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            feats = self._log_mel(wav)
+            self.model.config.forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+                language=self.language, task=self.task)
+            labels = self.processor.tokenizer(
+                target_text, return_tensors="pt").input_ids.to(self.device)
+            logits = self.model(input_features=feats, labels=labels).logits[0]
+            return self.processor.tokenizer.decode(
+                logits.argmax(-1), skip_special_tokens=True)
+
 
 # ----------------------------------------------------------------------------
 # 2. target oracle  (decision-only; gpt-transcribe returns {text, languages})
@@ -317,12 +331,15 @@ def zq_sequential_optimize(
         x0: np.ndarray, surrogates: List[WhiteBoxSurrogate], target_text: str,
         cfg: ZQConfig, target_audio: Optional[np.ndarray] = None,
         target_oracle: Optional[TargetOracle] = None, sr: int = 16000,
-        verbose: bool = False):
+        verbose: bool = False, debug_decode: bool = False):
     """Zero-query targeted perturbation via sequential ensemble optimization."""
     import time
     L = x0.shape[0]
     delta = (cfg.init_scale * target_audio) if target_audio is not None else np.zeros(L)
     delta = project_linf(delta, cfg.eps)
+
+    def short(name):
+        return name.split("/")[-1][:18]
 
     history = []
     t0 = time.time()
@@ -335,19 +352,28 @@ def zq_sequential_optimize(
             delta = project_linf(delta - lr * move, cfg.eps)
             step_losses.append(loss)
         if step % cfg.log_every == 0 or step == cfg.steps - 1:
-            row = {"step": step, "surr_loss": float(np.mean(step_losses))}
+            row = {"step": step, "surr_loss": float(np.mean(step_losses)),
+                   "per_surrogate": {short(s.name): round(l, 3)
+                                     for s, l in zip(surrogates, step_losses)}}
             if target_oracle is not None and cfg.eval_every and step % cfg.eval_every == 0:
                 r = target_oracle.transcribe(x0 + delta, sr)
                 row["target_cer"] = cer(target_text, r.text)
                 row["target_text"] = r.text
             history.append(row)
             if verbose:
-                el = time.time() - t0
-                per = el / (step + 1)
+                el = time.time() - t0; per = el / (step + 1)
                 eta = per * (cfg.steps - step - 1)
-                print(f"  [zq] step {step:>4}/{cfg.steps}  surr_loss="
-                      f"{row['surr_loss']:.3f}  {per:.1f}s/step  "
-                      f"elapsed {el/60:.1f}m  eta {eta/60:.1f}m", flush=True)
+                losses = "  ".join(f"{short(s.name)}={l:.2f}"
+                                   for s, l in zip(surrogates, step_losses))
+                print(f"  [zq] step {step:>4}/{cfg.steps}  {losses}  "
+                      f"{per:.1f}s/step  eta {eta/60:.1f}m", flush=True)
+                if debug_decode:                          # what each surrogate predicts
+                    for s in surrogates:
+                        try:
+                            txt = s.decode_teacher_forced(x0 + delta, target_text)
+                        except Exception as e:
+                            txt = f"<decode failed: {type(e).__name__}: {e}>"
+                        print(f"       {short(s.name):18s} -> {txt!r}", flush=True)
     return delta, history
 
 
