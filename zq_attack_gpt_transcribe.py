@@ -316,13 +316,16 @@ class ZQConfig:
 def zq_sequential_optimize(
         x0: np.ndarray, surrogates: List[WhiteBoxSurrogate], target_text: str,
         cfg: ZQConfig, target_audio: Optional[np.ndarray] = None,
-        target_oracle: Optional[TargetOracle] = None, sr: int = 16000):
+        target_oracle: Optional[TargetOracle] = None, sr: int = 16000,
+        verbose: bool = False):
     """Zero-query targeted perturbation via sequential ensemble optimization."""
+    import time
     L = x0.shape[0]
     delta = (cfg.init_scale * target_audio) if target_audio is not None else np.zeros(L)
     delta = project_linf(delta, cfg.eps)
 
     history = []
+    t0 = time.time()
     for step in range(cfg.steps):
         lr = cfg.lr * (1.0 - step / cfg.steps) if cfg.lr_decay else cfg.lr
         step_losses = []
@@ -338,6 +341,13 @@ def zq_sequential_optimize(
                 row["target_cer"] = cer(target_text, r.text)
                 row["target_text"] = r.text
             history.append(row)
+            if verbose:
+                el = time.time() - t0
+                per = el / (step + 1)
+                eta = per * (cfg.steps - step - 1)
+                print(f"  [zq] step {step:>4}/{cfg.steps}  surr_loss="
+                      f"{row['surr_loss']:.3f}  {per:.1f}s/step  "
+                      f"elapsed {el/60:.1f}m  eta {eta/60:.1f}m", flush=True)
     return delta, history
 
 
