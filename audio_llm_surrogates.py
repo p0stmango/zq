@@ -116,22 +116,36 @@ class Qwen2AudioSurrogate(AudioLLMSurrogate):
         self.model.gradient_checkpointing_enable()
         self.processor = AutoProcessor.from_pretrained(model_id)
 
-        feat = self.processor.feature_extractor              # match its mel config
-        self.melspec = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr, n_fft=getattr(feat, "n_fft", 400),
-            hop_length=getattr(feat, "hop_length", 160),
-            n_mels=feat.feature_size, power=2.0).to(device)
+        import numpy as np
+        feat = self.processor.feature_extractor
+        # Whisper-style front-end constants (Qwen2-Audio uses a Whisper encoder).
+        self.n_fft = getattr(feat, "n_fft", 400)
+        self.hop = getattr(feat, "hop_length", 160)
+        self.n_samples = getattr(feat, "n_samples", 480000)   # 30 s @ 16 kHz
+        self.n_frames = self.n_samples // self.hop            # 3000
+        self._window = torch.hann_window(self.n_fft, device=device)
+        # The model's OWN mel filterbank (shape [n_freqs, n_mels]); matmul below.
+        self._mel_filters = torch.tensor(
+            np.asarray(feat.mel_filters), dtype=torch.float32, device=device)
 
     def embed_tokens(self, input_ids):
         return self.model.get_input_embeddings()(input_ids)  # [L, d]
 
     def _audio_embeds(self, wav):
         torch = self.torch
-        mel = torch.clamp(self.melspec(wav), min=1e-10).log10()
-        mel = ((torch.maximum(mel, mel.max() - 8.0) + 4.0) / 4.0)
-        # Confirmed via introspect() on current transformers: audio_tower and
-        # multi_modal_projector are nested under .model. (Older versions expose
-        # them at the top level -> use self.model.audio_tower instead.)
+        # Differentiable Whisper log-mel: pad/trim to 30 s, STFT, model's filters.
+        n = self.n_samples
+        wav = (torch.nn.functional.pad(wav, (0, n - wav.shape[0]))
+               if wav.shape[0] < n else wav[:n])
+        stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
+                          window=self._window, return_complex=True)
+        mag = stft[..., :-1].abs() ** 2                       # [n_freqs, 3000]
+        mel = self._mel_filters.t() @ mag                     # [n_mels, 3000]
+        log = torch.clamp(mel, min=1e-10).log10()
+        log = torch.maximum(log, log.max() - 8.0)
+        mel = ((log + 4.0) / 4.0).to(self.model.dtype)        # match encoder dtype
+        # audio_tower + multi_modal_projector are nested under .model on current
+        # transformers (older versions expose them at the top level).
         core = self.model.model
         enc = core.audio_tower(mel.unsqueeze(0)).last_hidden_state
         return core.multi_modal_projector(enc)[0]            # [T_a, d]
@@ -181,15 +195,34 @@ def introspect_model(model, processor=None):
 
 
 class _MelFrontEnd:
-    """Differentiable log-mel shared by Whisper-encoder-based audio-LLMs."""
-    def _make_mel(self, torchaudio, sr, n_fft, hop, n_mels, device):
-        return torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr, n_fft=n_fft, hop_length=hop, n_mels=n_mels,
-            power=2.0).to(device)
+    """Differentiable Whisper-style log-mel derived from the model's OWN
+    processor, so filters and length match the encoder exactly. Shared by all
+    Whisper-encoder audio-LLMs (Qwen2-Audio, Voxtral, ...)."""
 
-    def _log_mel(self, torch, melspec, wav):
-        mel = torch.clamp(melspec(wav), min=1e-10).log10()
-        return (torch.maximum(mel, mel.max() - 8.0) + 4.0) / 4.0
+    def _init_whisper_mel(self, torch, feature_extractor, device):
+        import numpy as np
+        f = feature_extractor
+        self.n_fft = getattr(f, "n_fft", 400)
+        self.hop = getattr(f, "hop_length", 160)
+        self.n_samples = getattr(f, "n_samples", 480000)      # 30 s @ 16 kHz
+        self._window = torch.hann_window(self.n_fft, device=device)
+        mf = np.asarray(f.mel_filters)                        # want [n_freqs, n_mels]
+        n_freqs = self.n_fft // 2 + 1
+        if mf.shape[0] != n_freqs and mf.shape[1] == n_freqs:
+            mf = mf.T
+        self._mel_filters = torch.tensor(mf, dtype=torch.float32, device=device)
+
+    def _whisper_log_mel(self, torch, wav, out_dtype):
+        n = self.n_samples
+        wav = (torch.nn.functional.pad(wav, (0, n - wav.shape[0]))
+               if wav.shape[0] < n else wav[:n])
+        stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
+                          window=self._window, return_complex=True)
+        mag = stft[..., :-1].abs() ** 2                       # [n_freqs, frames]
+        mel = self._mel_filters.t() @ mag                     # [n_mels, frames]
+        log = torch.clamp(mel, min=1e-10).log10()
+        log = torch.maximum(log, log.max() - 8.0)
+        return ((log + 4.0) / 4.0).to(out_dtype)
 
 
 class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
@@ -205,7 +238,7 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
     POST = "[/INST]"
 
     def __init__(self, model_id="mistralai/Voxtral-Mini-3B-2507", device="cuda", sr=16000):
-        import torch, torchaudio
+        import torch
         from transformers import VoxtralForConditionalGeneration, AutoProcessor
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = VoxtralForConditionalGeneration.from_pretrained(
@@ -214,15 +247,18 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
             p.requires_grad_(False)
         self.model.gradient_checkpointing_enable()
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.melspec = self._make_mel(torchaudio, sr, 400, 160, 128, device)
+        self._init_whisper_mel(torch, self.processor.feature_extractor, device)
 
     def embed_tokens(self, input_ids):
         return self.model.get_input_embeddings()(input_ids)
 
     def _audio_embeds(self, wav):
-        mel = self._log_mel(self.torch, self.melspec, wav)[..., :3000]
-        enc = self.model.audio_tower(mel.unsqueeze(0)).last_hidden_state   # CONFIRM
-        return self.model.multi_modal_projector(enc)[0]                    # CONFIRM
+        mel = self._whisper_log_mel(self.torch, wav, self.model.dtype)
+        # CONFIRM these two paths + AUDIO_TOKEN via introspect_model() on Voxtral,
+        # then verify_surrogate.py --model voxtral. Likely nested under .model.
+        core = getattr(self.model, "model", self.model)
+        enc = core.audio_tower(mel.unsqueeze(0)).last_hidden_state
+        return core.multi_modal_projector(enc)[0]
 
     def _assemble(self, target_text, n_audio_tokens):
         return self._assemble_chat(self.processor.tokenizer, self.PRE, self.POST,
@@ -241,7 +277,7 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
     POST = "<|im_end|>\n<|im_start|>assistant\n"
 
     def __init__(self, model_id="Qwen/Qwen2.5-Omni-7B", device="cuda", sr=16000):
-        import torch, torchaudio
+        import torch
         from transformers import Qwen2_5OmniForConditionalGeneration, AutoProcessor
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
@@ -254,13 +290,13 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         self.thinker = self.model.thinker
         self.thinker.gradient_checkpointing_enable()
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.melspec = self._make_mel(torchaudio, sr, 400, 160, 128, device)
+        self._init_whisper_mel(torch, self.processor.feature_extractor, device)
 
     def embed_tokens(self, input_ids):
         return self.thinker.get_input_embeddings()(input_ids)
 
     def _audio_embeds(self, wav):
-        mel = self._log_mel(self.torch, self.melspec, wav)[..., :3000]
+        mel = self._whisper_log_mel(self.torch, wav, self.model.dtype)
         enc = self.thinker.audio_tower(mel.unsqueeze(0)).last_hidden_state   # CONFIRM
         return self.thinker.audio_projector(enc)[0]                          # CONFIRM
 
