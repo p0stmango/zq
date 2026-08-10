@@ -154,6 +154,7 @@ class PipelineConfig:
     fitness: FitnessWeights = field(default_factory=FitnessWeights)
     use_refinement: bool = True
     refine: RefineConfig = field(default_factory=RefineConfig)
+    debug_surrogates: bool = False        # print each surrogate's decode per log step
     # offline-only knobs
     alphabet: str = "abcdefgh"
 
@@ -259,7 +260,8 @@ def run(cfg: PipelineConfig, x0: np.ndarray,
         cfg.zq.log_every = min(cfg.zq.log_every, 10)   # feedback sooner on slow runs
     delta, _ = zq_sequential_optimize(x0, ensemble, cfg.target_text, cfg.zq,
                                       target_audio=tgt_audio, sr=cfg.sr,
-                                      verbose=(cfg.mode == "real"))
+                                      verbose=(cfg.mode == "real"),
+                                      debug_decode=cfg.debug_surrogates)
     r_zq = evaluate_transfer(x0, delta, build_target(cfg, target_centroids),
                              cfg.target_text, cfg.source_lang, cfg.fitness, cfg.sr)
     print(f"[stage 2: ZERO-QUERY ZQ]     adv={r_zq['adv_text']!r}  "
@@ -330,6 +332,8 @@ if __name__ == "__main__":
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--eps", type=float, default=0.02, help="L-inf bound (real audio)")
     ap.add_argument("--lr", type=float, default=0.001)
+    ap.add_argument("--debug-surrogates", action="store_true",
+                    help="print what each surrogate predicts at every log step")
     args = ap.parse_args()
 
     if args.real:
@@ -338,7 +342,7 @@ if __name__ == "__main__":
             raise SystemExit("--real needs --carrier path/to/clean.wav")
         cfg = PipelineConfig(
             mode="real", target_text=args.target, source_lang=args.lang,
-            use_refinement=args.refine,
+            use_refinement=args.refine, debug_surrogates=args.debug_surrogates,
             zq=ZQConfig(eps=args.eps, lr=args.lr, steps=args.steps, init_scale=0.3))
         x0, sr = sf.read(args.carrier)
         if getattr(x0, "ndim", 1) > 1:
