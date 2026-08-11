@@ -71,8 +71,11 @@ def do_introspect(model_key):
     }[model_key]
     Model = getattr(tf, cls)
     kw = {"trust_remote_code": True} if model_key in ("ultravox", "phi4") else {}
+    if model_key == "phi4":
+        kw["_attn_implementation"] = "eager"   # Phi4MM doesn't support FA2
     introspect_model(Model.from_pretrained(mid, **kw),
-                     AutoProcessor.from_pretrained(mid, **kw))
+                     AutoProcessor.from_pretrained(mid, **{k: v for k, v in kw.items()
+                                                          if k == "trust_remote_code"}))
 
 
 def do_verify(model_key):
