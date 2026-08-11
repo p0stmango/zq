@@ -535,6 +535,18 @@ class Phi4MultimodalSurrogate(AudioLLMSurrogate):
 # non-Whisper (fbank/conformer) differentiable front-end.
 
 
+def _match_frames(diff, ref):
+    """Trim/pad diff (1, T, C) time axis to match ref's frame count."""
+    tf = ref.shape[1] if ref.dim() == 3 else ref.shape[-2]
+    t = diff.shape[1]
+    if t == tf:
+        return diff
+    if t > tf:
+        return diff[:, :tf, :]
+    pad = diff[:, -1:, :].repeat(1, tf - t, 1)
+    return __import__("torch").cat([diff, pad], dim=1)
+
+
 class GraniteSpeechSurrogate(WhiteBoxSurrogate):
     """IBM Granite-Speech-3.3 -- 16 conformer blocks + q-former projector + Granite
     3.3 LLM. NATIVELY integrated in transformers (no trust_remote_code), so we use
@@ -572,16 +584,17 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         self.n_fft = getattr(self.fe, "n_fft", 400)
         self.hop = getattr(self.fe, "hop_length", 160)
         self._win = torch.hann_window(self.n_fft, device=device)
-        n_mels = getattr(self.fe, "feature_size", getattr(self.fe, "num_mel_bins", 80))
+        n_mels = getattr(self.fe, "feature_size", getattr(self.fe, "num_mel_bins", 160))
         self._mel_fb = Phi4MultimodalSurrogate._make_fbank(
             torch, np, n_mels, self.n_fft, sr, device)
 
     def _feats(self, wav):
+        # Granite wants (frames, n_mels) time-major features (n_mels=160).
         torch = self.torch
         stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
                           window=self._win, return_complex=True)
-        mel = self._mel_fb @ (stft.abs() ** 2)
-        return torch.log(torch.clamp(mel, min=1e-10)).t().to(self.model.dtype)
+        mel = self._mel_fb @ (stft.abs() ** 2)               # (n_mels, T)
+        return torch.log(torch.clamp(mel, min=1e-10)).t().to(self.model.dtype)  # (T, n_mels)
 
     def _build(self, wav_np, target_text):
         # Verified Granite usage: audio token inline in user content, and the
@@ -611,9 +624,9 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                             device=self.device).unsqueeze(0)
         full = torch.cat([input_ids, resp], dim=1)
         labels = torch.full_like(full, -100); labels[:, -resp.shape[1]:] = resp
-        # match feature dtype/shape to what the processor produced
-        pf = inputs["input_features"]
-        diff = diff.to(self.model.dtype).reshape(pf.shape) if diff.numel() == pf.numel() else diff.to(self.model.dtype)
+        # align frame count to the processor's features (trim/pad time axis)
+        pf = inputs["input_features"].to(self.device)
+        diff = _match_frames(diff, pf).to(self.model.dtype)
         out = self.model(input_ids=full, input_features=diff, labels=labels, **feat_kwargs)
         out.loss.backward()
         return float(out.loss.item()), wav.grad.detach().cpu().numpy()
@@ -633,8 +646,8 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                                 device=self.device).unsqueeze(0)
             full = torch.cat([input_ids, resp], dim=1)
-            pf = inputs["input_features"]
-            diff = diff.to(self.model.dtype).reshape(pf.shape) if diff.numel() == pf.numel() else diff.to(self.model.dtype)
+            pf = inputs["input_features"].to(self.device)
+            diff = _match_frames(diff, pf).to(self.model.dtype)
             logits = self.model(input_ids=full, input_features=diff, **feat_kwargs).logits[0]
             n = resp.shape[1]
             return tok.decode(logits[-n-1:-1].argmax(-1))
