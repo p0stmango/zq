@@ -351,7 +351,9 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         # Omni's tower transposes+chunks input_features (line ~762: input_features.T
         # .split(...)), so it wants an UNBATCHED (n_mels, T) mel, not (1, n_mels, T).
         flen = torch.tensor([mel.shape[-1]], device=self.device)
-        enc = self.thinker.audio_tower(mel, feature_lens=flen).last_hidden_state
+        # Omni's chunker does input_features.T.split(...): it wants TIME-MAJOR
+        # (frames, n_mels), so transpose our (n_mels, frames) mel.
+        enc = self.thinker.audio_tower(mel.t(), feature_lens=flen).last_hidden_state
         proj = getattr(self.thinker, "audio_projector", None)
         if proj is not None:
             enc = proj(enc)
