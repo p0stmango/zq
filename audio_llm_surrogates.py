@@ -283,6 +283,11 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
                 getattr(self.model, "model", self.model), meth, None)
             if fn is not None:
                 emb = fn(feats)
+                # native methods may return a tensor OR a ModelOutput wrapper
+                if not hasattr(emb, "dim"):
+                    emb = getattr(emb, "last_hidden_state", None)
+                    if emb is None:
+                        emb = getattr(emb, "audio_embeds", emb)
                 return emb[0] if emb.dim() == 3 else emb
         # Fallback (manual) -- only if no native method exists; frame-order may
         # differ, so confirm with the debug decode reading as real text.
