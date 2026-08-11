@@ -162,9 +162,9 @@ class PipelineConfig:
 def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
     if cfg.mode == "real":
         import time
-        from zq_attack_gpt_transcribe import WhisperSurrogate
         from audio_llm_surrogates import (
-            Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate)
+            Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate,
+            UltravoxSurrogate, Phi4MultimodalSurrogate)
 
         def _load(desc, fn):
             print(f"[load] {desc} ...", flush=True)
@@ -172,14 +172,24 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
             print(f"[load] {desc} ready ({time.time()-t:.0f}s)", flush=True)
             return s
 
-        # Multi-surrogate ensemble. Each must pass verify_surrogate.py first.
+        # Diverse audio-LLM ensemble (no Whisper-family dedicated ASR).
+        # LLM-backbone diversity: Qwen2 / Mistral / Qwen2.5 / Llama.
+        # The first four share a WHISPER-family encoder; Phi-4 (conformer) is the
+        # only ENCODER-diverse one and needs its front-end wired -- add it once it
+        # passes verify. Verify EACH with the debug decode before trusting it:
+        # a model that passes verify but decodes garbage (as Voxtral did) is worse
+        # than absent, because it injects noise gradients into the shared delta.
         ens = []
-        ens.append(_load("Qwen2-Audio-7B", lambda: Qwen2AudioSurrogate(
+        ens.append(_load("Qwen2-Audio-7B",  lambda: Qwen2AudioSurrogate(
             "Qwen/Qwen2-Audio-7B-Instruct", device="cuda")))
         ens.append(_load("Voxtral-Mini-3B", lambda: VoxtralSurrogate(
             "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
-        ens.append(_load("Whisper-medium", lambda: WhisperSurrogate(
-            "openai/whisper-medium", language=cfg.source_lang, device="cuda")))
+        ens.append(_load("Qwen2.5-Omni-7B", lambda: Qwen25OmniSurrogate(
+            "Qwen/Qwen2.5-Omni-7B", device="cuda")))
+        ens.append(_load("Ultravox-Llama",  lambda: UltravoxSurrogate(
+            "fixie-ai/ultravox-v0_5-llama-3_1-8b", device="cuda")))
+        # ens.append(_load("Phi-4-MM (conformer)", lambda: Phi4MultimodalSurrogate(
+        #     "microsoft/Phi-4-multimodal-instruct", device="cuda")))  # wire first
         return ens
     base = np.linspace(-1.0, 1.0, len(cfg.alphabet))
     return [
