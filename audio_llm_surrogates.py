@@ -554,7 +554,19 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.processor = GraniteSpeechProcessor.from_pretrained(model_id)
-        self.fe = self.processor.feature_extractor
+        # GraniteSpeechProcessor may expose its extractor under a different name.
+        self.fe = (getattr(self.processor, "feature_extractor", None)
+                   or getattr(self.processor, "audio_processor", None)
+                   or getattr(self.processor, "audio_feature_extractor", None))
+        if self.fe is None:
+            for a in dir(self.processor):          # scan for an extractor object
+                obj = getattr(self.processor, a, None)
+                if obj is not None and "eatureextractor" in type(obj).__name__.lower():
+                    self.fe = obj; break
+        if self.fe is None:
+            raise RuntimeError(
+                "Could not find Granite's feature extractor. Run: print([a for a "
+                "in dir(processor) if not a.startswith('_')]) and tell me the name.")
         # Differentiable mel matched to Granite's feature extractor.
         import numpy as np
         self.n_fft = getattr(self.fe, "n_fft", 400)
