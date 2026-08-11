@@ -603,7 +603,10 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
 
     def _real_feats(self, wav_np):
         """Ground-truth features from Granite's own extractor (non-diff)."""
-        out = self.fe(wav_np, sampling_rate=self.sr, return_tensors="pt")
+        try:
+            out = self.fe(wav_np, return_tensors="pt")
+        except TypeError:
+            out = self.fe(wav_np, sampling_rate=self.sr, return_tensors="pt")
         key = "input_features" if "input_features" in out else list(out.keys())[0]
         return out[key].to(self.device)
 
