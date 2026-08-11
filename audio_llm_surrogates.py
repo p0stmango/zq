@@ -246,21 +246,18 @@ class _MelFrontEnd:
 
 
 class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
-    """Mistral's Voxtral -- Whisper-style encoder + Mistral LLM, purpose-built for
-    transcription, so a strong architectural cousin of gpt-transcribe. Apache-2.0.
-
-    CONFIRM VIA introspect(): the encoder/projector submodule names and the audio
-    placeholder token below are best-effort for current transformers; adjust to
-    what introspect_model() prints, then run verify_surrogate.py.
+    """Mistral's Voxtral -- Whisper-large-v3 encoder + Mistral LLM, purpose-built
+    for transcription. Voxtral does NOT use a text chat template for audio; it has
+    a dedicated transcribe mode built by processor.apply_transcription_request
+    (MistralCommonTokenizer + WhisperFeatureExtractor). We build the real request,
+    then swap in a differentiable log-mel so gradients reach the waveform.
     """
-    AUDIO_TOKEN = "[AUDIO]"
-    PRE = "<s>[INST]Transcribe this audio:"
-    POST = "[/INST]"
 
     def __init__(self, model_id="mistralai/Voxtral-Mini-3B-2507", device="cuda", sr=16000):
         import torch
         from transformers import VoxtralForConditionalGeneration, AutoProcessor
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
+        self.model_id = model_id
         self.model = VoxtralForConditionalGeneration.from_pretrained(
             model_id, torch_dtype=torch.bfloat16).to(device).eval()
         for p in self.model.parameters():
@@ -269,33 +266,63 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         self.processor = AutoProcessor.from_pretrained(model_id)
         self._init_whisper_mel(torch, self.processor.feature_extractor, device)
 
+    def _build_inputs(self, wav_np, target_text):
+        """Real Voxtral transcription request + differentiable input_features."""
+        import numpy as np
+        torch = self.torch
+        # processor builds the correct transcribe-mode input_ids + a (non-diff)
+        # input_features; we keep its ids and replace features with our own.
+        req = self.processor.apply_transcription_request(
+            language=self.sr and "en", audio=wav_np.astype(np.float32),
+            model_id=self.model_id, sampling_rate=self.sr)
+        return req
+
+    def loss_grad(self, waveform, target_text):
+        torch = self.torch
+        wav = torch.tensor(waveform, dtype=torch.float32,
+                           device=self.device, requires_grad=True)
+        diff_feats = self._whisper_log_mel(torch, wav, self.model.dtype)  # (n_mels, 3000)
+        import numpy as np
+        req = self._build_inputs(np.asarray(waveform, dtype=np.float32), target_text)
+        input_ids = req["input_ids"].to(self.device)
+        # append the target transcript as the labels/response
+        tok = self.processor.tokenizer
+        resp = torch.tensor(tok.encode(target_text), device=self.device).unsqueeze(0)
+        full_ids = torch.cat([input_ids, resp], dim=1)
+        labels = torch.full_like(full_ids, -100)
+        labels[:, -resp.shape[1]:] = resp
+        out = self.model(input_ids=full_ids,
+                         input_features=diff_feats.unsqueeze(0).to(self.model.dtype),
+                         labels=labels)
+        out.loss.backward()
+        return float(out.loss.item()), wav.grad.detach().cpu().numpy()
+
+    def decode_teacher_forced(self, waveform, target_text):
+        torch = self.torch
+        with torch.no_grad():
+            import numpy as np
+            wav = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            diff_feats = self._whisper_log_mel(torch, wav, self.model.dtype)
+            req = self._build_inputs(np.asarray(waveform, dtype=np.float32), target_text)
+            input_ids = req["input_ids"].to(self.device)
+            tok = self.processor.tokenizer
+            resp = torch.tensor(tok.encode(target_text), device=self.device).unsqueeze(0)
+            full_ids = torch.cat([input_ids, resp], dim=1)
+            logits = self.model(
+                input_ids=full_ids,
+                input_features=diff_feats.unsqueeze(0).to(self.model.dtype)).logits[0]
+            n = resp.shape[1]
+            return tok.decode(logits[-n-1:-1].argmax(-1))
+
+    # unused for Voxtral (custom loss_grad above), kept for the ABC
     def embed_tokens(self, input_ids):
         return self.model.get_input_embeddings()(input_ids)
 
     def _audio_embeds(self, wav):
-        torch = self.torch
-        mel = self._whisper_log_mel(torch, wav, self.model.dtype)   # (n_mels, 3000)
-        feats = mel.unsqueeze(0)                                     # (1, n_mels, 3000)
-        # Use Voxtral's OWN audio pipeline (encoder + pool + reshape + projector)
-        # -- reimplementing the frame-stack reshape scrambled the embeddings.
-        for meth in ("get_audio_embeds", "get_audio_features"):
-            fn = getattr(self.model, meth, None) or getattr(
-                getattr(self.model, "model", self.model), meth, None)
-            if fn is not None:
-                out = fn(feats)
-                # get_audio_embeds runs encoder + projector and stores the
-                # PROJECTED embeds in .pooler_output (last_hidden_state is the
-                # raw 1280-dim encoder output -- reading it gave the byte-salad).
-                emb = getattr(out, "pooler_output", None)
-                if emb is None:
-                    emb = getattr(out, "last_hidden_state", out)
-                return emb[0] if emb.dim() == 3 else emb
-        # Manual fallback matching modeling_voxtral: encoder ->
-        # reshape(-1, intermediate_size) -> projector (flat reshape, not batched).
-        core = getattr(self.model, "model", self.model)
-        enc = core.audio_tower(feats).last_hidden_state
-        proj = core.multi_modal_projector
-        return proj(enc.reshape(-1, proj.linear_1.in_features))
+        raise NotImplementedError("Voxtral uses a custom loss_grad path.")
+
+    def _assemble(self, target_text, n_audio_tokens):
+        raise NotImplementedError("Voxtral uses a custom loss_grad path.")
         # Fallback (manual) -- only if no native method exists; frame-order may
         # differ, so confirm with the debug decode reading as real text.
         core = getattr(self.model, "model", self.model)
