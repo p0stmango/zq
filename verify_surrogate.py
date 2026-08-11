@@ -23,7 +23,7 @@ def build(model_key: str):
     from zq_attack_gpt_transcribe import WhisperSurrogate
     from audio_llm_surrogates import (
         Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate,
-        UltravoxSurrogate, Phi4MultimodalSurrogate)
+        UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate)
     factory = {
         "whisper":      lambda: WhisperSurrogate("openai/whisper-medium",
                                                  language="en", device="cuda"),
@@ -37,6 +37,8 @@ def build(model_key: str):
                                     "fixie-ai/ultravox-v0_5-llama-3_1-8b", device="cuda"),
         "phi4":         lambda: Phi4MultimodalSurrogate(
                                     "microsoft/Phi-4-multimodal-instruct", device="cuda"),
+        "granite":      lambda: GraniteSpeechSurrogate(
+                                    "ibm-granite/granite-speech-3.3-8b", device="cuda"),
     }
     return factory[model_key]()
 
@@ -73,6 +75,7 @@ def do_introspect(model_key):
     kw = {"trust_remote_code": True} if model_key in ("ultravox", "phi4") else {}
     if model_key == "phi4":
         kw["_attn_implementation"] = "eager"   # Phi4MM doesn't support FA2
+        kw["device_map"] = "cuda"              # avoid meta-tensor .item() error
     introspect_model(Model.from_pretrained(mid, **kw),
                      AutoProcessor.from_pretrained(mid, **{k: v for k, v in kw.items()
                                                           if k == "trust_remote_code"}))
@@ -96,7 +99,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen2-audio",
                     choices=["whisper", "qwen2-audio", "voxtral", "qwen2.5-omni",
-                             "ultravox", "phi4"])
+                             "ultravox", "phi4", "granite"])
     ap.add_argument("--introspect", action="store_true",
                     help="print real submodule paths + audio token instead of verifying")
     args = ap.parse_args()
