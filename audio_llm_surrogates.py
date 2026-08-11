@@ -472,7 +472,7 @@ class Phi4MultimodalSurrogate(AudioLLMSurrogate):
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
-            _attn_implementation="eager").to(device).eval()
+            _attn_implementation="eager", device_map=device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
@@ -533,6 +533,83 @@ class Phi4MultimodalSurrogate(AudioLLMSurrogate):
 # Granite-Speech-3.3-8B (IBM) is another strong CONFORMER + LLM option for encoder
 # diversity; wire it like Phi-4 once you have Phi-4 working, since both need a
 # non-Whisper (fbank/conformer) differentiable front-end.
+
+
+class GraniteSpeechSurrogate(WhiteBoxSurrogate):
+    """IBM Granite-Speech-3.3 -- 16 conformer blocks + q-former projector + Granite
+    3.3 LLM. NATIVELY integrated in transformers (no trust_remote_code), so we use
+    the model's own forward: processor builds input_ids (with the <|audio|> token)
+    and input_features; we swap in a differentiable mel and let the model splice.
+    Conformer encoder -> genuine encoder diversity vs the Whisper-family models.
+    """
+
+    def __init__(self, model_id="ibm-granite/granite-speech-3.3-8b",
+                 device="cuda", sr=16000):
+        import torch
+        from transformers import (GraniteSpeechForConditionalGeneration,
+                                  GraniteSpeechProcessor)
+        self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
+        self.model = GraniteSpeechForConditionalGeneration.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, device_map=device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.processor = GraniteSpeechProcessor.from_pretrained(model_id)
+        self.fe = self.processor.feature_extractor
+        # Differentiable mel matched to Granite's feature extractor.
+        import numpy as np
+        self.n_fft = getattr(self.fe, "n_fft", 400)
+        self.hop = getattr(self.fe, "hop_length", 160)
+        self._win = torch.hann_window(self.n_fft, device=device)
+        n_mels = getattr(self.fe, "feature_size", getattr(self.fe, "num_mel_bins", 80))
+        self._mel_fb = Phi4MultimodalSurrogate._make_fbank(
+            torch, np, n_mels, self.n_fft, sr, device)
+
+    def _feats(self, wav):
+        torch = self.torch
+        stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
+                          window=self._win, return_complex=True)
+        mel = self._mel_fb @ (stft.abs() ** 2)
+        return torch.log(torch.clamp(mel, min=1e-10)).t().to(self.model.dtype)
+
+    def _build(self, wav_np, target_text):
+        conv = [{"role": "user", "content": [
+            {"type": "audio", "audio": wav_np},
+            {"type": "text", "text": "Transcribe the following audio:"}]}]
+        return self.processor.apply_chat_template(
+            conv, tokenize=True, return_tensors="pt")
+
+    def loss_grad(self, waveform, target_text):
+        torch = self.torch
+        import numpy as np
+        wav = torch.tensor(waveform, dtype=torch.float32,
+                           device=self.device, requires_grad=True)
+        diff = self._feats(wav).unsqueeze(0)                 # (1, T, n_mels)
+        inputs = self._build(np.asarray(waveform, dtype=np.float32), target_text)
+        input_ids = inputs["input_ids"].to(self.device)
+        tok = self.processor.tokenizer
+        resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
+                            device=self.device).unsqueeze(0)
+        full = torch.cat([input_ids, resp], dim=1)
+        labels = torch.full_like(full, -100); labels[:, -resp.shape[1]:] = resp
+        out = self.model(input_ids=full, input_features=diff, labels=labels)
+        out.loss.backward()
+        return float(out.loss.item()), wav.grad.detach().cpu().numpy()
+
+    def decode_teacher_forced(self, waveform, target_text):
+        torch = self.torch
+        import numpy as np
+        with torch.no_grad():
+            wav = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            diff = self._feats(wav).unsqueeze(0)
+            inputs = self._build(np.asarray(waveform, dtype=np.float32), target_text)
+            input_ids = inputs["input_ids"].to(self.device)
+            tok = self.processor.tokenizer
+            resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
+                                device=self.device).unsqueeze(0)
+            full = torch.cat([input_ids, resp], dim=1)
+            logits = self.model(input_ids=full, input_features=diff).logits[0]
+            n = resp.shape[1]
+            return tok.decode(logits[-n-1:-1].argmax(-1))
 
 
 # ============================================================================
