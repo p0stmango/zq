@@ -164,7 +164,7 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
         import time
         from audio_llm_surrogates import (
             Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate,
-            UltravoxSurrogate, Phi4MultimodalSurrogate)
+            UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate)
 
         def _load(desc, fn):
             print(f"[load] {desc} ...", flush=True)
