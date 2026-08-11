@@ -447,16 +447,27 @@ class UltravoxSurrogate(AudioLLMSurrogate, _MelFrontEnd):
 
 
 class Phi4MultimodalSurrogate(AudioLLMSurrogate):
-    """Phi-4-multimodal -- CONFORMER encoder + Phi-4 LLM (audio LoRA). This is the
-    only genuinely ENCODER-diverse surrogate here, and the hardest: its front-end
-    is an 80-dim log-mel FBANK -> conv -> Conformer (NOT Whisper's mel), plus
-    trust_remote_code and audio LoRA adapters, so `_whisper_log_mel` does NOT
-    apply. Loads for introspection, but _audio_embeds must be wired to its own
-    feature path -- paste the introspect output and I'll finish it."""
+    """Phi-4-multimodal -- CONFORMER encoder (3 conv + 24 conformer blocks,
+    subsample x8, 80ms tokens) + Phi-4-Mini LLM via audio LoRA. The ONLY
+    encoder-diverse surrogate: its front-end is an 80-dim log-Mel FBANK at 10ms
+    frames, NOT Whisper's mel -- so it has its own differentiable fbank below.
+
+    Two things to CONFIRM from `--model phi4 --introspect`, because they've moved
+    across transformers 5.x versions:
+      (1) the audio-encoder submodule path used in _audio_embeds, and
+      (2) the encoder's forward signature (mask arg or not).
+    Common current path: model.model.embed_tokens_extend.audio_embed.{encoder,
+    audio_projection}. Adjust to what introspect prints, then the decode must
+    read English before you trust it.
+    """
+
+    N_MELS = 80
+    AUDIO_TOKEN = "<|audio_1|>"
 
     def __init__(self, model_id="microsoft/Phi-4-multimodal-instruct",
                  device="cuda", sr=16000):
         import torch
+        import numpy as np
         from transformers import AutoModelForCausalLM, AutoProcessor
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -465,22 +476,58 @@ class Phi4MultimodalSurrogate(AudioLLMSurrogate):
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        self._n_fft, self._hop = 400, 160                      # 25ms / 10ms @ 16k
+        self._win = torch.hann_window(self._n_fft, device=device)
+        self._mel_fb = self._make_fbank(torch, np, self.N_MELS, self._n_fft, sr, device)
+
+    @staticmethod
+    def _make_fbank(torch, np, n_mels, n_fft, sr, device):
+        def hz2mel(f): return 2595.0 * np.log10(1.0 + f / 700.0)
+        def mel2hz(m): return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+        n_freqs = n_fft // 2 + 1
+        hz = mel2hz(np.linspace(hz2mel(0), hz2mel(sr / 2), n_mels + 2))
+        bins = np.floor((n_fft + 1) * hz / sr).astype(int)
+        fb = np.zeros((n_mels, n_freqs), dtype=np.float32)
+        for m in range(1, n_mels + 1):
+            l, c, r = bins[m - 1], bins[m], bins[m + 1]
+            for k in range(l, c):
+                if c > l: fb[m - 1, k] = (k - l) / (c - l)
+            for k in range(c, r):
+                if r > c: fb[m - 1, k] = (r - k) / (r - c)
+        return torch.tensor(fb, device=device)
+
+    def _fbank(self, wav):
+        """Differentiable 80-dim log-mel fbank -> (frames, 80)."""
+        torch = self.torch
+        stft = torch.stft(wav, self._n_fft, hop_length=self._hop,
+                          window=self._win, return_complex=True)
+        mel = self._mel_fb @ (stft.abs() ** 2)                 # (80, T)
+        return torch.log(torch.clamp(mel, min=1e-10)).t().to(self.model.dtype)  # (T,80)
+
+    def _audio_embeds(self, wav):
+        torch = self.torch
+        feats = self._fbank(wav).unsqueeze(0)                  # (1, T, 80)
+        core = self.model.model                                # CONFIRM path below:
+        ae = core.embed_tokens_extend.audio_embed
+        mask = torch.ones(feats.shape[:2], dtype=torch.long, device=self.device)
+        try:
+            enc = ae.encoder(feats, mask)                      # CONFIRM signature
+        except TypeError:
+            enc = ae.encoder(feats)
+        enc = enc[0] if isinstance(enc, (tuple, list)) else getattr(
+            enc, "last_hidden_state", enc)
+        proj = getattr(ae, "audio_projection", None) or getattr(ae, "up_proj", None)
+        emb = proj(enc) if proj is not None else enc
+        return emb[0] if emb.dim() == 3 else emb
 
     def embed_tokens(self, input_ids):
         return self.model.get_input_embeddings()(input_ids)
 
-    def _audio_embeds(self, wav):
-        raise NotImplementedError(
-            "Phi-4-MM needs a differentiable FBANK front-end + its audio-LoRA "
-            "encoder path -- not Whisper mel. Run "
-            "`verify_surrogate.py --model phi4 --introspect`, share the audio "
-            "submodule names, and I'll wire _audio_embeds/_assemble to them.")
-
     def _assemble(self, target_text, n_audio_tokens):
-        # Phi-4 uses <|audio_1|>-style placeholders; confirm via introspect.
         return self._assemble_chat(self.processor.tokenizer,
-                                   "<|user|>Transcribe the audio: ", "<|end|><|assistant|>",
-                                   "<|audio_1|>", target_text, n_audio_tokens)
+                                   "<|user|>Transcribe the audio: ",
+                                   "<|end|><|assistant|>",
+                                   self.AUDIO_TOKEN, target_text, n_audio_tokens)
 
 
 # Granite-Speech-3.3-8B (IBM) is another strong CONFORMER + LLM option for encoder
