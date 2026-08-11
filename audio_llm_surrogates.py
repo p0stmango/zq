@@ -381,6 +381,14 @@ class UltravoxSurrogate(AudioLLMSurrogate, _MelFrontEnd):
                  device="cuda", sr=16000):
         import torch
         from transformers import AutoModel, AutoProcessor
+        # Ultravox v0.5 remote code expects transformers.modeling_utils._init_weights
+        # (a module global removed in transformers 5.x). Restore it so its
+        # _create_audio_tower works. If loading fails LATER with a different
+        # AttributeError, Ultravox v0.5 is simply incompatible with your
+        # transformers -- pin a compatible revision= or drop this surrogate.
+        import transformers.modeling_utils as _mu
+        if not hasattr(_mu, "_init_weights"):
+            _mu._init_weights = True
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = AutoModel.from_pretrained(
             model_id, torch_dtype=torch.bfloat16,
