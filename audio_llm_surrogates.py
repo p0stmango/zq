@@ -581,20 +581,40 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                 "in dir(processor) if not a.startswith('_')]) and tell me the name.")
         # Differentiable mel matched to Granite's feature extractor.
         import numpy as np
-        self.n_fft = getattr(self.fe, "n_fft", 400)
+        
         self.hop = getattr(self.fe, "hop_length", 160)
         self._win = torch.hann_window(self.n_fft, device=device)
-        n_mels = getattr(self.fe, "feature_size", getattr(self.fe, "num_mel_bins", 160))
+        # Read Granite's REAL feature geometry off its extractor (diagnostic
+        # showed 160 mels, ~50 frames, normalized ~mean0.6/std0.13 -- my raw
+        # 80-mel log-mel was wrong on all three axes).
+        self.n_fft = getattr(self.fe, "n_fft", None) or getattr(self.fe, "fft_length", 512)
+        self.hop = (getattr(self.fe, "hop_length", None)
+                    or getattr(self.fe, "frame_shift", None) or 160)
+        # Granite: 10ms frame shift @16k -> hop 160 gives 100Hz; it outputs ~50
+        # frames/s (10Hz after downsample) but the EXTRACTOR features are pre-
+        # downsample. If frame count is 2x off, its win/hop differ -- probe prints
+        # them. Default to what matches 160-dim, ~50-frame output for 1s:
+        self.hop = getattr(self.fe, "hop_length", 320)
+        self._win = torch.hann_window(self.n_fft, device=device)
+        n_mels = (getattr(self.fe, "num_mel_bins", None)
+                  or getattr(self.fe, "feature_size", None) or 160)
+        self._n_mels = n_mels
         self._mel_fb = Phi4MultimodalSurrogate._make_fbank(
             torch, np, n_mels, self.n_fft, sr, device)
+        # per-utterance normalization stats to match (mean/std) if the extractor
+        # exposes them; else standardize (which reproduces the observed ~0-mean).
+        self._norm = getattr(self.fe, "do_normalize", True)
 
     def _feats(self, wav):
-        # Granite wants (frames, n_mels) time-major features (n_mels=160).
+        # (frames, n_mels) time-major, matched to Granite's extractor + normalized.
         torch = self.torch
-        stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
+        stft = torch.stft(wav, self._n_fft, hop_length=self.hop,
                           window=self._win, return_complex=True)
         mel = self._mel_fb @ (stft.abs() ** 2)               # (n_mels, T)
-        return torch.log(torch.clamp(mel, min=1e-10)).t().to(self.model.dtype)  # (T, n_mels)
+        logmel = torch.log(torch.clamp(mel, min=1e-10)).t()  # (T, n_mels)
+        if self._norm:                                       # per-utterance MVN
+            logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-5)
+        return logmel.to(self.model.dtype)
 
     def _build(self, wav_np, target_text):
         # Verified Granite usage: audio token inline in user content, and the
