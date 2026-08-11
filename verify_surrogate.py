@@ -22,7 +22,8 @@ import numpy as np
 def build(model_key: str):
     from zq_attack_gpt_transcribe import WhisperSurrogate
     from audio_llm_surrogates import (
-        Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate)
+        Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate,
+        UltravoxSurrogate, Phi4MultimodalSurrogate)
     factory = {
         "whisper":      lambda: WhisperSurrogate("openai/whisper-medium",
                                                  language="en", device="cuda"),
@@ -32,6 +33,10 @@ def build(model_key: str):
                                     "mistralai/Voxtral-Mini-3B-2507", device="cuda"),
         "qwen2.5-omni": lambda: Qwen25OmniSurrogate(
                                     "Qwen/Qwen2.5-Omni-7B", device="cuda"),
+        "ultravox":     lambda: UltravoxSurrogate(
+                                    "fixie-ai/ultravox-v0_5-llama-3_1-8b", device="cuda"),
+        "phi4":         lambda: Phi4MultimodalSurrogate(
+                                    "microsoft/Phi-4-multimodal-instruct", device="cuda"),
     }
     return factory[model_key]()
 
@@ -54,14 +59,20 @@ def do_introspect(model_key):
         "qwen2-audio":  "Qwen2AudioForConditionalGeneration",
         "voxtral":      "VoxtralForConditionalGeneration",
         "qwen2.5-omni": "Qwen2_5OmniForConditionalGeneration",
+        "ultravox":     "AutoModel",
+        "phi4":         "AutoModelForCausalLM",
     }[model_key]
     mid = {
         "qwen2-audio":  "Qwen/Qwen2-Audio-7B-Instruct",
         "voxtral":      "mistralai/Voxtral-Mini-3B-2507",
         "qwen2.5-omni": "Qwen/Qwen2.5-Omni-7B",
+        "ultravox":     "fixie-ai/ultravox-v0_5-llama-3_1-8b",
+        "phi4":         "microsoft/Phi-4-multimodal-instruct",
     }[model_key]
     Model = getattr(tf, cls)
-    introspect_model(Model.from_pretrained(mid), AutoProcessor.from_pretrained(mid))
+    kw = {"trust_remote_code": True} if model_key in ("ultravox", "phi4") else {}
+    introspect_model(Model.from_pretrained(mid, **kw),
+                     AutoProcessor.from_pretrained(mid, **kw))
 
 
 def do_verify(model_key):
@@ -81,7 +92,8 @@ def do_verify(model_key):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen2-audio",
-                    choices=["whisper", "qwen2-audio", "voxtral", "qwen2.5-omni"])
+                    choices=["whisper", "qwen2-audio", "voxtral", "qwen2.5-omni",
+                             "ultravox", "phi4"])
     ap.add_argument("--introspect", action="store_true",
                     help="print real submodule paths + audio token instead of verifying")
     args = ap.parse_args()
