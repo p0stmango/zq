@@ -185,10 +185,10 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
         # Voxtral parked: its transcribe-mode prompt scaffolding still produces
         # byte-salad after multiple rewrites. Re-enable only once its debug decode
         # reads English (needs apply_transcription_request wired correctly).
-        # ens.append(_load("Voxtral-Mini-3B", lambda: VoxtralSurrogate(
-        #     "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
-        ens.append(_load("Qwen2.5-Omni-7B", lambda: Qwen25OmniSurrogate(
-            "Qwen/Qwen2.5-Omni-7B", device="cuda")))
+        ens.append(_load("Voxtral-Mini-3B", lambda: VoxtralSurrogate(
+            "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
+        #ens.append(_load("Qwen2.5-Omni-7B", lambda: Qwen25OmniSurrogate(
+        #    "Qwen/Qwen2.5-Omni-7B", device="cuda")))
         # Ultravox v0.5 remote code is incompatible with transformers 5.x (meta-device
         # init + _init_weights). Re-enable only with a compatible revision= / newer
         # Ultravox, or a transformers downgrade you DON'T want (breaks the others).
