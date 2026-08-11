@@ -282,24 +282,20 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
             fn = getattr(self.model, meth, None) or getattr(
                 getattr(self.model, "model", self.model), meth, None)
             if fn is not None:
-                emb = fn(feats)
-                if not hasattr(emb, "dim"):                  # unwrap ModelOutput
-                    emb = getattr(emb, "last_hidden_state", emb)
-                if emb.dim() == 2:
-                    emb = emb.unsqueeze(0)                   # -> (1, T, D)
-                proj = getattr(self.model, "multi_modal_projector", None) or \
-                    getattr(getattr(self.model, "model", self.model),
-                            "multi_modal_projector")
-                d = emb.shape[-1]
-                need = proj.linear_1.in_features             # 5120 = D * k
-                if d != proj.linear_2.out_features:          # emb is encoder-dim -> project
-                    if need != d:                            # frame-stack by k first
-                        k = need // d
-                        b, t, _ = emb.shape
-                        t2 = (t // k) * k
-                        emb = emb[:, :t2, :].reshape(b, t2 // k, d * k)
-                    emb = proj(emb)
+                out = fn(feats)
+                # get_audio_embeds runs encoder + projector and stores the
+                # PROJECTED embeds in .pooler_output (last_hidden_state is the
+                # raw 1280-dim encoder output -- reading it gave the byte-salad).
+                emb = getattr(out, "pooler_output", None)
+                if emb is None:
+                    emb = getattr(out, "last_hidden_state", out)
                 return emb[0] if emb.dim() == 3 else emb
+        # Manual fallback matching modeling_voxtral: encoder ->
+        # reshape(-1, intermediate_size) -> projector (flat reshape, not batched).
+        core = getattr(self.model, "model", self.model)
+        enc = core.audio_tower(feats).last_hidden_state
+        proj = core.multi_modal_projector
+        return proj(enc.reshape(-1, proj.linear_1.in_features))
         # Fallback (manual) -- only if no native method exists; frame-order may
         # differ, so confirm with the debug decode reading as real text.
         core = getattr(self.model, "model", self.model)
