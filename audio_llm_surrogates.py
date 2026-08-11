@@ -283,11 +283,22 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
                 getattr(self.model, "model", self.model), meth, None)
             if fn is not None:
                 emb = fn(feats)
-                # native methods may return a tensor OR a ModelOutput wrapper
-                if not hasattr(emb, "dim"):
-                    emb = getattr(emb, "last_hidden_state", None)
-                    if emb is None:
-                        emb = getattr(emb, "audio_embeds", emb)
+                if not hasattr(emb, "dim"):                  # unwrap ModelOutput
+                    emb = getattr(emb, "last_hidden_state", emb)
+                if emb.dim() == 2:
+                    emb = emb.unsqueeze(0)                   # -> (1, T, D)
+                proj = getattr(self.model, "multi_modal_projector", None) or \
+                    getattr(getattr(self.model, "model", self.model),
+                            "multi_modal_projector")
+                d = emb.shape[-1]
+                need = proj.linear_1.in_features             # 5120 = D * k
+                if d != proj.linear_2.out_features:          # emb is encoder-dim -> project
+                    if need != d:                            # frame-stack by k first
+                        k = need // d
+                        b, t, _ = emb.shape
+                        t2 = (t // k) * k
+                        emb = emb[:, :t2, :].reshape(b, t2 // k, d * k)
+                    emb = proj(emb)
                 return emb[0] if emb.dim() == 3 else emb
         # Fallback (manual) -- only if no native method exists; frame-order may
         # differ, so confirm with the debug decode reading as real text.
