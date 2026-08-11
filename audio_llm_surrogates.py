@@ -581,34 +581,25 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                 "in dir(processor) if not a.startswith('_')]) and tell me the name.")
         # Differentiable mel matched to Granite's feature extractor.
         import numpy as np
-        
-        self.hop = getattr(self.fe, "hop_length", 160)
+        # Granite feature geometry read off its extractor (diagnostic showed
+        # 160 mels, ~50 frames, normalized ~mean0.6/std0.13; raw 80-mel log-mel
+        # was wrong on channels, frame rate, and scale). Attribute names vary,
+        # so probe with /tmp/granite_probe.py and pin exact values if needed.
+        self.n_fft = int(getattr(self.fe, "n_fft", None)
+                         or getattr(self.fe, "fft_length", None) or 512)
+        self.hop = int(getattr(self.fe, "hop_length", None)
+                       or getattr(self.fe, "frame_shift", None) or 320)
+        self.n_mels = int(getattr(self.fe, "num_mel_bins", None)
+                          or getattr(self.fe, "feature_size", None) or 160)
         self._win = torch.hann_window(self.n_fft, device=device)
-        # Read Granite's REAL feature geometry off its extractor (diagnostic
-        # showed 160 mels, ~50 frames, normalized ~mean0.6/std0.13 -- my raw
-        # 80-mel log-mel was wrong on all three axes).
-        self.n_fft = getattr(self.fe, "n_fft", None) or getattr(self.fe, "fft_length", 512)
-        self.hop = (getattr(self.fe, "hop_length", None)
-                    or getattr(self.fe, "frame_shift", None) or 160)
-        # Granite: 10ms frame shift @16k -> hop 160 gives 100Hz; it outputs ~50
-        # frames/s (10Hz after downsample) but the EXTRACTOR features are pre-
-        # downsample. If frame count is 2x off, its win/hop differ -- probe prints
-        # them. Default to what matches 160-dim, ~50-frame output for 1s:
-        self.hop = getattr(self.fe, "hop_length", 320)
-        self._win = torch.hann_window(self.n_fft, device=device)
-        n_mels = (getattr(self.fe, "num_mel_bins", None)
-                  or getattr(self.fe, "feature_size", None) or 160)
-        self._n_mels = n_mels
         self._mel_fb = Phi4MultimodalSurrogate._make_fbank(
-            torch, np, n_mels, self.n_fft, sr, device)
-        # per-utterance normalization stats to match (mean/std) if the extractor
-        # exposes them; else standardize (which reproduces the observed ~0-mean).
-        self._norm = getattr(self.fe, "do_normalize", True)
+            torch, np, self.n_mels, self.n_fft, sr, device)
+        self._norm = bool(getattr(self.fe, "do_normalize", True))
 
     def _feats(self, wav):
         # (frames, n_mels) time-major, matched to Granite's extractor + normalized.
         torch = self.torch
-        stft = torch.stft(wav, self._n_fft, hop_length=self.hop,
+        stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
                           window=self._win, return_complex=True)
         mel = self._mel_fb @ (stft.abs() ** 2)               # (n_mels, T)
         logmel = torch.log(torch.clamp(mel, min=1e-10)).t()  # (T, n_mels)
