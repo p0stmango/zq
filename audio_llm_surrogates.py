@@ -273,8 +273,8 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         # processor builds the correct transcribe-mode input_ids + a (non-diff)
         # input_features; we keep its ids and replace features with our own.
         req = self.processor.apply_transcription_request(
-            language=self.sr and "en", audio=wav_np.astype(np.float32),
-            model_id=self.model_id, sampling_rate=self.sr)
+            language="en", audio=wav_np.astype(np.float32),
+            model_id=self.model_id, sampling_rate=self.sr, format="wav")
         return req
 
     def loss_grad(self, waveform, target_text):
