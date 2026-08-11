@@ -186,8 +186,11 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
             "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
         ens.append(_load("Qwen2.5-Omni-7B", lambda: Qwen25OmniSurrogate(
             "Qwen/Qwen2.5-Omni-7B", device="cuda")))
-        ens.append(_load("Ultravox-Llama",  lambda: UltravoxSurrogate(
-            "fixie-ai/ultravox-v0_5-llama-3_1-8b", device="cuda")))
+        # Ultravox v0.5 remote code is incompatible with transformers 5.x (meta-device
+        # init + _init_weights). Re-enable only with a compatible revision= / newer
+        # Ultravox, or a transformers downgrade you DON'T want (breaks the others).
+        # ens.append(_load("Ultravox-Llama",  lambda: UltravoxSurrogate(
+        #     "fixie-ai/ultravox-v0_5-llama-3_1-8b", device="cuda")))
         # ens.append(_load("Phi-4-MM (conformer)", lambda: Phi4MultimodalSurrogate(
         #     "microsoft/Phi-4-multimodal-instruct", device="cuda")))  # wire first
         return ens
