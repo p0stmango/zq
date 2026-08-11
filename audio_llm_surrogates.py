@@ -274,17 +274,25 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
 
     def _audio_embeds(self, wav):
         torch = self.torch
-        mel = self._whisper_log_mel(torch, wav, self.model.dtype)
+        mel = self._whisper_log_mel(torch, wav, self.model.dtype)   # (n_mels, 3000)
+        feats = mel.unsqueeze(0)                                     # (1, n_mels, 3000)
+        # Use Voxtral's OWN audio pipeline (encoder + pool + reshape + projector)
+        # -- reimplementing the frame-stack reshape scrambled the embeddings.
+        for meth in ("get_audio_embeds", "get_audio_features"):
+            fn = getattr(self.model, meth, None) or getattr(
+                getattr(self.model, "model", self.model), meth, None)
+            if fn is not None:
+                emb = fn(feats)
+                return emb[0] if emb.dim() == 3 else emb
+        # Fallback (manual) -- only if no native method exists; frame-order may
+        # differ, so confirm with the debug decode reading as real text.
         core = getattr(self.model, "model", self.model)
-        enc = core.audio_tower(mel.unsqueeze(0)).last_hidden_state    # (1, T, D)
-        # Voxtral's projector consumes frames STACKED by k (linear_1.in_features
-        # = D*k); concatenate k adjacent encoder frames before projecting.
+        enc = core.audio_tower(feats).last_hidden_state
         proj = core.multi_modal_projector
         b, t, d = enc.shape
-        k = proj.linear_1.in_features // d                           # Voxtral: 4
+        k = proj.linear_1.in_features // d
         t2 = (t // k) * k
-        enc = enc[:, :t2, :].reshape(b, t2 // k, d * k)              # (1, T/k, D*k)
-        return proj(enc)[0]                                          # (T/k, d_llm)
+        return proj(enc[:, :t2, :].reshape(b, t2 // k, d * k))[0]
 
     def _assemble(self, target_text, n_audio_tokens):
         return self._assemble_chat(self.processor.tokenizer, self.PRE, self.POST,
@@ -344,10 +352,84 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
                                    self.AUDIO_TOKEN, target_text, n_audio_tokens)
 
 
-# Phi-4-multimodal (conformer encoder + Phi-4 LLM, trust_remote_code=True) and
-# Gemma-3n (gated) follow the same recipe: introspect -> fill the three bindings
-# -> verify. Their front-end is conformer, not log-mel, so _audio_embeds calls
-# the model's own feature path on a differentiable waveform rather than _log_mel.
+class UltravoxSurrogate(AudioLLMSurrogate, _MelFrontEnd):
+    """Ultravox -- Whisper encoder + Llama LLM. Adds a LLAMA backbone (encoder is
+    still Whisper-family, so this is LLM diversity, not encoder diversity).
+    CONFIRM bindings via `verify_surrogate.py --model ultravox --introspect` and
+    the debug decode."""
+    AUDIO_TOKEN = "<|audio|>"
+    PRE = "<|start_header_id|>user<|end_header_id|>\n\nTranscribe the audio:"
+    POST = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    def __init__(self, model_id="fixie-ai/ultravox-v0_5-llama-3_1-8b",
+                 device="cuda", sr=16000):
+        import torch
+        from transformers import AutoModel, AutoProcessor
+        self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
+        self.model = AutoModel.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16,
+            trust_remote_code=True).to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        self._init_whisper_mel(torch, self.processor.feature_extractor, device)
+
+    def embed_tokens(self, input_ids):
+        return self.model.get_input_embeddings()(input_ids)
+
+    def _audio_embeds(self, wav):
+        mel = self._whisper_log_mel(self.torch, wav, self.model.dtype)
+        feats = mel.unsqueeze(0)
+        for meth in ("get_audio_embeds", "get_audio_features"):
+            fn = getattr(self.model, meth, None)
+            if fn is not None:
+                emb = fn(feats)
+                return emb[0] if emb.dim() == 3 else emb
+        core = getattr(self.model, "model", self.model)              # CONFIRM
+        enc = core.audio_tower(feats).last_hidden_state
+        return core.multi_modal_projector(enc)[0]
+
+
+class Phi4MultimodalSurrogate(AudioLLMSurrogate):
+    """Phi-4-multimodal -- CONFORMER encoder + Phi-4 LLM (audio LoRA). This is the
+    only genuinely ENCODER-diverse surrogate here, and the hardest: its front-end
+    is an 80-dim log-mel FBANK -> conv -> Conformer (NOT Whisper's mel), plus
+    trust_remote_code and audio LoRA adapters, so `_whisper_log_mel` does NOT
+    apply. Loads for introspection, but _audio_embeds must be wired to its own
+    feature path -- paste the introspect output and I'll finish it."""
+
+    def __init__(self, model_id="microsoft/Phi-4-multimodal-instruct",
+                 device="cuda", sr=16000):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoProcessor
+        self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
+            _attn_implementation="eager").to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+    def embed_tokens(self, input_ids):
+        return self.model.get_input_embeddings()(input_ids)
+
+    def _audio_embeds(self, wav):
+        raise NotImplementedError(
+            "Phi-4-MM needs a differentiable FBANK front-end + its audio-LoRA "
+            "encoder path -- not Whisper mel. Run "
+            "`verify_surrogate.py --model phi4 --introspect`, share the audio "
+            "submodule names, and I'll wire _audio_embeds/_assemble to them.")
+
+    def _assemble(self, target_text, n_audio_tokens):
+        # Phi-4 uses <|audio_1|>-style placeholders; confirm via introspect.
+        return self._assemble_chat(self.processor.tokenizer,
+                                   "<|user|>Transcribe the audio: ", "<|end|><|assistant|>",
+                                   "<|audio_1|>", target_text, n_audio_tokens)
+
+
+# Granite-Speech-3.3-8B (IBM) is another strong CONFORMER + LLM option for encoder
+# diversity; wire it like Phi-4 once you have Phi-4 working, since both need a
+# non-Whisper (fbank/conformer) differentiable front-end.
 
 
 # ============================================================================
