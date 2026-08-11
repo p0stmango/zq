@@ -602,13 +602,15 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         return (lm - lm.mean()) / (lm.std() + 1e-5)
 
     def _real_feats(self, wav_np):
-        """Ground-truth features from Granite's own extractor (non-diff)."""
-        try:
-            out = self.fe(wav_np, return_tensors="pt")
-        except TypeError:
-            out = self.fe(wav_np, sampling_rate=self.sr, return_tensors="pt")
+        """Ground-truth features from Granite's own extractor (non-diff).
+        GraniteSpeechFeatureExtractor.__call__(audios, device='cpu') -> BatchFeature;
+        it takes ONLY audios + device (no return_tensors / sampling_rate)."""
+        out = self.fe(wav_np, device=self.device)
         key = "input_features" if "input_features" in out else list(out.keys())[0]
-        return out[key].to(self.device)
+        feats = out[key]
+        if not hasattr(feats, "to"):                 # ensure tensor
+            feats = self.torch.as_tensor(feats)
+        return feats.to(self.device)
 
     def _feats_straight_through(self, wav, wav_np):
         """Real features in value, proxy gradient in backward (straight-through)."""
