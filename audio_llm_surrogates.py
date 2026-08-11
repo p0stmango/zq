@@ -346,9 +346,20 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         return self.thinker.get_input_embeddings()(input_ids)
 
     def _audio_embeds(self, wav):
-        mel = self._whisper_log_mel(self.torch, wav, self.model.dtype)
-        enc = self.thinker.audio_tower(mel.unsqueeze(0)).last_hidden_state   # CONFIRM
-        return self.thinker.audio_projector(enc)[0]                          # CONFIRM
+        torch = self.torch
+        mel = self._whisper_log_mel(torch, wav, self.model.dtype)   # (n_mels, T)
+        feats = mel.unsqueeze(0)                                    # (1, n_mels, T)
+        # Qwen2.5-Omni's audio tower chunks by length and REQUIRES feature_lens
+        # (valid frames per clip). We always feed a full 30s mel, so it's T.
+        flen = torch.tensor([mel.shape[-1]], device=self.device)
+        try:
+            enc = self.thinker.audio_tower(
+                feats, feature_lens=flen).last_hidden_state         # CONFIRM
+        except TypeError:
+            enc = self.thinker.audio_tower(
+                feats.squeeze(0), feature_lens=flen).last_hidden_state
+        return self.thinker.audio_projector(enc)[0] if hasattr(
+            self.thinker, "audio_projector") else enc[0]            # CONFIRM projector
 
     def loss_grad(self, waveform, target_text):
         # Same splice/CE as the base, but through the Thinker submodule.
