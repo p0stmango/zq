@@ -581,31 +581,41 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                 "in dir(processor) if not a.startswith('_')]) and tell me the name.")
         # Differentiable mel matched to Granite's feature extractor.
         import numpy as np
-        # Granite feature geometry read off its extractor (diagnostic showed
-        # 160 mels, ~50 frames, normalized ~mean0.6/std0.13; raw 80-mel log-mel
-        # was wrong on channels, frame rate, and scale). Attribute names vary,
-        # so probe with /tmp/granite_probe.py and pin exact values if needed.
-        self.n_fft = int(getattr(self.fe, "n_fft", None)
-                         or getattr(self.fe, "fft_length", None) or 512)
-        self.hop = int(getattr(self.fe, "hop_length", None)
-                       or getattr(self.fe, "frame_shift", None) or 320)
-        self.n_mels = int(getattr(self.fe, "num_mel_bins", None)
-                          or getattr(self.fe, "feature_size", None) or 160)
+        # Granite's extractor is MelFilterBankFeatureExtractor: melspec_n_mels=80
+        # but emits 160 features (80 mel + deltas) with its own framing + norm.
+        # Reconstructing that by hand is fragile, so we use the REAL features for
+        # correctness and attach a differentiable straight-through link to the
+        # waveform (grad flows via a matched differentiable log-mel proxy).
+        self.n_fft, self.hop, self.n_mels = 400, 160, 80
         self._win = torch.hann_window(self.n_fft, device=device)
         self._mel_fb = Phi4MultimodalSurrogate._make_fbank(
             torch, np, self.n_mels, self.n_fft, sr, device)
-        self._norm = bool(getattr(self.fe, "do_normalize", True))
 
-    def _feats(self, wav):
-        # (frames, n_mels) time-major, matched to Granite's extractor + normalized.
+    def _proxy(self, wav):
+        """Differentiable log-mel proxy (80-dim) -> (T, 80); only used to carry
+        gradients, not for the model's actual features."""
         torch = self.torch
         stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
                           window=self._win, return_complex=True)
-        mel = self._mel_fb @ (stft.abs() ** 2)               # (n_mels, T)
-        logmel = torch.log(torch.clamp(mel, min=1e-10)).t()  # (T, n_mels)
-        if self._norm:                                       # per-utterance MVN
-            logmel = (logmel - logmel.mean()) / (logmel.std() + 1e-5)
-        return logmel.to(self.model.dtype)
+        mel = self._mel_fb @ (stft.abs() ** 2)
+        lm = torch.log(torch.clamp(mel, min=1e-10)).t()
+        return (lm - lm.mean()) / (lm.std() + 1e-5)
+
+    def _real_feats(self, wav_np):
+        """Ground-truth features from Granite's own extractor (non-diff)."""
+        out = self.fe(wav_np, sampling_rate=self.sr, return_tensors="pt")
+        key = "input_features" if "input_features" in out else list(out.keys())[0]
+        return out[key].to(self.device)
+
+    def _feats_straight_through(self, wav, wav_np):
+        """Real features in value, proxy gradient in backward (straight-through)."""
+        torch = self.torch
+        real = self._real_feats(wav_np).to(self.model.dtype)     # (1, T, 160)
+        proxy = self._proxy(wav)                                 # (T, 80) differentiable
+        # tile proxy to 160 and match frames so shapes align, then STE:
+        p = torch.cat([proxy, proxy], dim=-1)                    # (T, 160)
+        p = _match_frames(p.unsqueeze(0), real).to(self.model.dtype)
+        return real + (p - p.detach())                           # value=real, grad=proxy
 
     def _build(self, wav_np, target_text):
         # Verified Granite usage: audio token inline in user content, and the
@@ -623,8 +633,9 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         import numpy as np
         wav = torch.tensor(waveform, dtype=torch.float32,
                            device=self.device, requires_grad=True)
-        diff = self._feats(wav).unsqueeze(0)                 # differentiable feats
-        inputs = self._build(np.asarray(waveform, dtype=np.float32), target_text)
+        wav_np = np.asarray(waveform, dtype=np.float32)
+        diff = self._feats_straight_through(wav, wav_np)     # real value, proxy grad
+        inputs = self._build(wav_np, target_text)
         input_ids = inputs["input_ids"].to(self.device)
         # feature key: Granite uses input_features (may also want a mask)
         feat_kwargs = {}
@@ -635,9 +646,6 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                             device=self.device).unsqueeze(0)
         full = torch.cat([input_ids, resp], dim=1)
         labels = torch.full_like(full, -100); labels[:, -resp.shape[1]:] = resp
-        # align frame count to the processor's features (trim/pad time axis)
-        pf = inputs["input_features"].to(self.device)
-        diff = _match_frames(diff, pf).to(self.model.dtype)
         out = self.model(input_ids=full, input_features=diff, labels=labels, **feat_kwargs)
         out.loss.backward()
         return float(out.loss.item()), wav.grad.detach().cpu().numpy()
@@ -647,8 +655,9 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         import numpy as np
         with torch.no_grad():
             wav = torch.tensor(waveform, dtype=torch.float32, device=self.device)
-            diff = self._feats(wav).unsqueeze(0)
-            inputs = self._build(np.asarray(waveform, dtype=np.float32), target_text)
+            wav_np = np.asarray(waveform, dtype=np.float32)
+            diff = self._feats_straight_through(wav, wav_np)
+            inputs = self._build(wav_np, target_text)
             input_ids = inputs["input_ids"].to(self.device)
             feat_kwargs = {}
             if "input_features_mask" in inputs:
@@ -657,8 +666,6 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                                 device=self.device).unsqueeze(0)
             full = torch.cat([input_ids, resp], dim=1)
-            pf = inputs["input_features"].to(self.device)
-            diff = _match_frames(diff, pf).to(self.model.dtype)
             logits = self.model(input_ids=full, input_features=diff, **feat_kwargs).logits[0]
             n = resp.shape[1]
             return tok.decode(logits[-n-1:-1].argmax(-1))
