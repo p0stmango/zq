@@ -584,26 +584,37 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         return torch.log(torch.clamp(mel, min=1e-10)).t().to(self.model.dtype)
 
     def _build(self, wav_np, target_text):
-        conv = [{"role": "user", "content": [
-            {"type": "audio", "audio": wav_np},
-            {"type": "text", "text": "Transcribe the following audio:"}]}]
-        return self.processor.apply_chat_template(
-            conv, tokenize=True, return_tensors="pt")
+        # Verified Granite usage: audio token inline in user content, and the
+        # PROCESSOR takes (text, wav) together -- it expands <|audio|> to the
+        # right number of placeholders to match the audio length. We keep its
+        # input_ids and swap in our differentiable features in loss_grad.
+        chat = [{"role": "user",
+                 "content": "<|audio|>Transcribe the speech into written text."}]
+        text = self.processor.tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True)
+        return self.processor(text, wav_np, return_tensors="pt")
 
     def loss_grad(self, waveform, target_text):
         torch = self.torch
         import numpy as np
         wav = torch.tensor(waveform, dtype=torch.float32,
                            device=self.device, requires_grad=True)
-        diff = self._feats(wav).unsqueeze(0)                 # (1, T, n_mels)
+        diff = self._feats(wav).unsqueeze(0)                 # differentiable feats
         inputs = self._build(np.asarray(waveform, dtype=np.float32), target_text)
         input_ids = inputs["input_ids"].to(self.device)
+        # feature key: Granite uses input_features (may also want a mask)
+        feat_kwargs = {}
+        if "input_features_mask" in inputs:
+            feat_kwargs["input_features_mask"] = inputs["input_features_mask"].to(self.device)
         tok = self.processor.tokenizer
         resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                             device=self.device).unsqueeze(0)
         full = torch.cat([input_ids, resp], dim=1)
         labels = torch.full_like(full, -100); labels[:, -resp.shape[1]:] = resp
-        out = self.model(input_ids=full, input_features=diff, labels=labels)
+        # match feature dtype/shape to what the processor produced
+        pf = inputs["input_features"]
+        diff = diff.to(self.model.dtype).reshape(pf.shape) if diff.numel() == pf.numel() else diff.to(self.model.dtype)
+        out = self.model(input_ids=full, input_features=diff, labels=labels, **feat_kwargs)
         out.loss.backward()
         return float(out.loss.item()), wav.grad.detach().cpu().numpy()
 
@@ -615,11 +626,16 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             diff = self._feats(wav).unsqueeze(0)
             inputs = self._build(np.asarray(waveform, dtype=np.float32), target_text)
             input_ids = inputs["input_ids"].to(self.device)
+            feat_kwargs = {}
+            if "input_features_mask" in inputs:
+                feat_kwargs["input_features_mask"] = inputs["input_features_mask"].to(self.device)
             tok = self.processor.tokenizer
             resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                                 device=self.device).unsqueeze(0)
             full = torch.cat([input_ids, resp], dim=1)
-            logits = self.model(input_ids=full, input_features=diff).logits[0]
+            pf = inputs["input_features"]
+            diff = diff.to(self.model.dtype).reshape(pf.shape) if diff.numel() == pf.numel() else diff.to(self.model.dtype)
+            logits = self.model(input_ids=full, input_features=diff, **feat_kwargs).logits[0]
             n = resp.shape[1]
             return tok.decode(logits[-n-1:-1].argmax(-1))
 
