@@ -594,7 +594,15 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         # Granite was the only surrogate missing this. Without it the conformer
         # encoder + Granite LLM keeps all intermediate activations resident for
         # the full backward pass, which on long audio tips the pool over the edge.
-        self.model.gradient_checkpointing_enable()
+        # REPLACE with this:
+        try:
+            self.model.gradient_checkpointing_enable()
+        except ValueError:
+            # GraniteSpeechForConditionalGeneration is a composite model and doesn't
+            # expose checkpointing at the top level — enable it on the LM backbone only.
+            lm = getattr(self.model, "language_model", None)
+            if lm is not None:
+                lm.gradient_checkpointing_enable()
         # ----------------------------------------------------------------------
 
         self.processor = GraniteSpeechProcessor.from_pretrained(model_id)
