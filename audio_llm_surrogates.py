@@ -276,56 +276,69 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         self.processor = AutoProcessor.from_pretrained(model_id)
         self._init_whisper_mel(torch, self.processor.feature_extractor, device)
 
-    def _build_inputs(self, wav_np, target_text):
-        """Real Voxtral transcription request + differentiable input_features."""
-        import numpy as np
-        torch = self.torch
-        # processor builds the correct transcribe-mode input_ids + a (non-diff)
-        # input_features; we keep its ids and replace features with our own.
-        req = self.processor.apply_transcription_request(
-            language="en", audio=wav_np.astype(np.float32),
-            model_id=self.model_id, sampling_rate=self.sr, format="wav")
-        return req
+    def _get_input_ids(self, waveform_np):
+        """Build and cache Voxtral's transcription-mode input_ids.
+
+        input_ids only depends on audio length and language (hardcoded to "en"),
+        not on audio content, so they're stable across optimization steps.
+        We cache after the first call to avoid rerunning the non-differentiable
+        feature extraction on every step.
+        """
+        audio_len = len(waveform_np)
+        if getattr(self, "_cached_input_ids_len", None) != audio_len:
+            req = self.processor.apply_transcription_request(
+                language="en", audio=waveform_np.astype(np.float32),
+                model_id=self.model_id, sampling_rate=self.sr, format="wav")
+            self._cached_input_ids = req["input_ids"].to(self.device)
+            self._cached_input_ids_len = audio_len
+        return self._cached_input_ids
 
     def loss_grad(self, waveform, target_text):
-        torch = self.torch
-        wav = torch.tensor(waveform, dtype=torch.float32,
-                           device=self.device, requires_grad=True)
-        diff_feats = self._whisper_log_mel(torch, wav, self.model.dtype)  # (n_mels, 3000)
         import numpy as np
-        req = self._build_inputs(np.asarray(waveform, dtype=np.float32), target_text)
-        input_ids = req["input_ids"].to(self.device)
-        # append the target transcript as the labels/response
-        tok = self.processor.tokenizer
-        resp = torch.tensor(tok.encode(target_text), device=self.device).unsqueeze(0)
-        full_ids = torch.cat([input_ids, resp], dim=1)
-        labels = torch.full_like(full_ids, -100)
+        torch = self.torch
+        wav    = torch.tensor(waveform, dtype=torch.float32,
+                              device=self.device, requires_grad=True)
+        diff_feats = self._whisper_log_mel(torch, wav, self.model.dtype)
+
+        # Fix: add_special_tokens=False -- Voxtral's tokenizer adds BOS/EOS by
+        # default, inflating resp and making the CE loss optimize for nonsensical
+        # mid-sequence BOS/EOS tokens. This was the primary convergence bottleneck:
+        # the debug decodes showing "I</s>", "II love", "You</s> love" are all
+        # artifacts of the inflated n sliding the decode window back into the prompt.
+        tok  = self.processor.tokenizer
+        resp = torch.tensor(
+            tok.encode(target_text, add_special_tokens=False),
+            device=self.device).unsqueeze(0)
+
+        input_ids = self._get_input_ids(np.asarray(waveform, dtype=np.float32))
+        full_ids  = torch.cat([input_ids, resp], dim=1)
+        labels    = torch.full_like(full_ids, -100)
         labels[:, -resp.shape[1]:] = resp
+
         out = self.model(input_ids=full_ids,
                          input_features=diff_feats.unsqueeze(0).to(self.model.dtype),
                          labels=labels)
         out.loss.backward()
 
-        # --- Memory fix -------------------------------------------------------
         loss_val = float(out.loss.item())
         grad_val = wav.grad.detach().cpu().numpy()
         del out, diff_feats, full_ids, labels, resp, wav
         torch.cuda.empty_cache()
-        # ----------------------------------------------------------------------
         return loss_val, grad_val
 
     def decode_teacher_forced(self, waveform, target_text):
+        import numpy as np
         torch = self.torch
         with torch.no_grad():
-            import numpy as np
-            wav = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            wav        = torch.tensor(waveform, dtype=torch.float32, device=self.device)
             diff_feats = self._whisper_log_mel(torch, wav, self.model.dtype)
-            req = self._build_inputs(np.asarray(waveform, dtype=np.float32), target_text)
-            input_ids = req["input_ids"].to(self.device)
-            tok = self.processor.tokenizer
-            resp = torch.tensor(tok.encode(target_text), device=self.device).unsqueeze(0)
-            full_ids = torch.cat([input_ids, resp], dim=1)
-            logits = self.model(
+            tok        = self.processor.tokenizer
+            resp       = torch.tensor(
+                tok.encode(target_text, add_special_tokens=False),
+                device=self.device).unsqueeze(0)
+            input_ids  = self._get_input_ids(np.asarray(waveform, dtype=np.float32))
+            full_ids   = torch.cat([input_ids, resp], dim=1)
+            logits     = self.model(
                 input_ids=full_ids,
                 input_features=diff_feats.unsqueeze(0).to(self.model.dtype)).logits[0]
             n = resp.shape[1]
@@ -759,7 +772,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         inputs    = self._build(wav_np, target_text)
         input_ids = inputs["input_ids"].to(self.device)
         extra = {k: v.to(self.device) for k, v in inputs.items()
-                 if k not in ("input_ids", "input_features", "attention_mask")}
+                 if k not in ("input_ids", "input_features")}
 
         tok  = self.processor.tokenizer
         resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
@@ -787,7 +800,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             inputs = self._build(wav_np, target_text)
             input_ids = inputs["input_ids"].to(self.device)
             extra = {k: v.to(self.device) for k, v in inputs.items()
-                 if k not in ("input_ids", "input_features", "attention_mask")}
+                     if k not in ("input_ids", "input_features")}
             tok  = self.processor.tokenizer
             resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                                 device=self.device).unsqueeze(0)
