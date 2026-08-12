@@ -772,7 +772,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         inputs    = self._build(wav_np, target_text)
         input_ids = inputs["input_ids"].to(self.device)
         extra = {k: v.to(self.device) for k, v in inputs.items()
-                 if k not in ("input_ids", "input_features")}
+                 if k not in ("input_ids", "input_features", "attention_mask")}
 
         tok  = self.processor.tokenizer
         resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
@@ -800,7 +800,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             inputs = self._build(wav_np, target_text)
             input_ids = inputs["input_ids"].to(self.device)
             extra = {k: v.to(self.device) for k, v in inputs.items()
-                     if k not in ("input_ids", "input_features")}
+                     if k not in ("input_ids", "input_features", "attention_mask")}
             tok  = self.processor.tokenizer
             resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                                 device=self.device).unsqueeze(0)
