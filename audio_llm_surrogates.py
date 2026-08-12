@@ -642,7 +642,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         mel = self._mel_fb @ (stft.abs() ** 2)              # (80, T)
         lm = torch.log(torch.clamp(mel, min=1e-10)).t()     # (T, 80)
         # per-utterance normalisation (matches MelFilterBankFeatureExtractor)
-        lm = (lm - lm.mean()) / (lm.std() + 1e-5)
+        lm = (lm - lm.mean(dim=0, keepdim=True)) / (lm.std(dim=0, keepdim=True) + 1e-5)
         # differentiable delta via depthwise conv1d, standard N=2 kernel:
         #   delta[t] = (-2*f[t-2] - f[t-1] + f[t+1] + 2*f[t+2]) / 10
         k = torch.tensor([-2., -1., 0., 1., 2.],
