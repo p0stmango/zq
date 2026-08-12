@@ -647,12 +647,12 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         #   delta[t] = (-2*f[t-2] - f[t-1] + f[t+1] + 2*f[t+2]) / 10
         k = torch.tensor([-2., -1., 0., 1., 2.],
                          device=self.device, dtype=lm.dtype) / 10.0
-        lm_t = lm.t().unsqueeze(1)                          # (80, 1, T)
+        lm_t = lm.t().unsqueeze(0)                          # (80, 1, T)
         delta = torch.nn.functional.conv1d(
             lm_t,
             k.view(1, 1, -1).expand(80, -1, -1),
             padding=2, groups=80
-        ).squeeze(1).t()                                    # (T, 80)
+        ).squeeze(0).t()                                    # (T, 80)
         return torch.cat([lm, delta], dim=-1)               # (T, 160)
 
     def _real_feats(self, wav_np):
