@@ -632,14 +632,28 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             torch, np, self.n_mels, self.n_fft, sr, device)
 
     def _proxy(self, wav):
-        """Differentiable log-mel proxy (80-dim) -> (T, 80); only used to carry
-        gradients, not for the model's actual features."""
+        """Differentiable mel + delta(mel) -> (T, 160), matching Granite's
+        MelFilterBankFeatureExtractor layout. Previously this tiled mel twice
+        (mel || mel) instead of computing mel || delta(mel), which gave the STE
+        a wrong-signed gradient and made Granite's updates pure noise."""
         torch = self.torch
         stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
                           window=self._win, return_complex=True)
-        mel = self._mel_fb @ (stft.abs() ** 2)
-        lm = torch.log(torch.clamp(mel, min=1e-10)).t()
-        return (lm - lm.mean()) / (lm.std() + 1e-5)
+        mel = self._mel_fb @ (stft.abs() ** 2)              # (80, T)
+        lm = torch.log(torch.clamp(mel, min=1e-10)).t()     # (T, 80)
+        # per-utterance normalisation (matches MelFilterBankFeatureExtractor)
+        lm = (lm - lm.mean()) / (lm.std() + 1e-5)
+        # differentiable delta via depthwise conv1d, standard N=2 kernel:
+        #   delta[t] = (-2*f[t-2] - f[t-1] + f[t+1] + 2*f[t+2]) / 10
+        k = torch.tensor([-2., -1., 0., 1., 2.],
+                         device=self.device, dtype=lm.dtype) / 10.0
+        lm_t = lm.t().unsqueeze(1)                          # (80, 1, T)
+        delta = torch.nn.functional.conv1d(
+            lm_t,
+            k.view(1, 1, -1).expand(80, -1, -1),
+            padding=2, groups=80
+        ).squeeze(1).t()                                    # (T, 80)
+        return torch.cat([lm, delta], dim=-1)               # (T, 160)
 
     def _real_feats(self, wav_np):
         """Ground-truth features from Granite's own extractor (non-diff).
