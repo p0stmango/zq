@@ -20,6 +20,15 @@ Read the accuracy caveats in `ZQ_FIDELITY` at the bottom before trusting results
 
 from __future__ import annotations
 
+# --- Memory fix: must be set before torch is imported anywhere. ---------------
+# expandable_segments:True lets the CUDA allocator grow segments dynamically,
+# which eliminates the "failed to allocate X while Y free" fragmentation OOM
+# that occurs when there is enough total free memory but no single contiguous
+# block large enough to satisfy the request.
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# -----------------------------------------------------------------------------
+
 import abc
 from dataclasses import dataclass, field
 from typing import List, Optional
