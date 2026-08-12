@@ -810,6 +810,241 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             n = resp.shape[1]
             return tok.decode(logits[-n-1:-1].argmax(-1))
 
+class CanaryQwenSurrogate(WhiteBoxSurrogate):
+    """NVIDIA Canary-Qwen-2.5B -- FastConformer encoder + linear proj + Qwen3-1.7B LLM (LoRA).
+
+    Architecture (from introspection):
+      perception: AudioPerceptionModule
+        preprocessor: AudioToMelSpectrogramPreprocessor (FilterbankFeatures)
+        modality_adapter: IdentityConnector
+        encoder: ConformerEncoder (FastConformer)
+        proj: Linear
+      embed_tokens: Embedding   -- LLM's text embedding table
+      llm: PeftModelForCausalLM -- Qwen3-1.7B + LoRA
+
+    Feature pipeline (exact params from FilterbankFeatures):
+      pre-emphasis(0.97) -> STFT(n_fft=512, win=400, hop=160)
+      -> power(2.0) -> mel(128) -> log(mel + 5.96e-8) [additive guard]
+      -> per-feature CMVN -> (1, 128, T) BFT format
+
+    Gradient path:
+      waveform -> _diff_feats -> perception(processed_signal=...)
+      -> audio_embeds splice with text embeds -> llm(inputs_embeds=...) -> CE loss
+
+    The processed_signal bypass skips the non-differentiable NeMo preprocessor
+    and feeds directly into the differentiable ConformerEncoder. The IdentityConnector
+    means no Q-former complexity -- audio tokens map 1:1 through a linear projection.
+    """
+
+    AUDIO_PLACEHOLDER_ID = 151669       # '<|audioplaceholder|>'
+    PROMPT = "Transcribe the following: <|audioplaceholder|>"
+
+    def __init__(self, model_id="nvidia/canary-qwen-2.5b", device="cuda", sr=16000):
+        import torch
+        from nemo.collections.speechlm2.models import SALM
+        self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
+
+        self.model = SALM.from_pretrained(model_id).to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        # Gradient checkpointing on the LLM
+        for target in [self.model.llm,
+                       getattr(self.model.llm, 'base_model', None)]:
+            if target is not None:
+                try:
+                    target.gradient_checkpointing_enable(); break
+                except Exception:
+                    pass
+
+        fb = self.model.perception.preprocessor.featurizer
+        self._init_differentiable_frontend(torch, fb, device)
+        self._prompt_ids = None                         # cached after first call
+        self._llm_dtype  = next(self.model.llm.parameters()).dtype
+
+    def _init_differentiable_frontend(self, torch, fb, device):
+        """Extract exact params from NeMo's FilterbankFeatures."""
+        import numpy as np
+
+        self.n_fft      = int(fb.n_fft)            # 512
+        self.hop        = int(fb.hop_length)        # 160
+        self.win_length = int(fb.win_length)        # 400
+        self.n_mels     = int(fb.nfilt)             # 128
+        self._preemph   = float(fb.preemph)         # 0.97
+        self._log_guard = float(fb.log_zero_guard_value)  # 5.96e-8
+
+        # Reuse the featurizer's own window tensor (Hann-400, already on device)
+        self._win = fb.window.detach().to(device).float()
+
+        # Extract mel filterbank from NeMo's featurizer buffers (2-D buffer)
+        n_freqs = self.n_fft // 2 + 1              # 257
+        mel_src, mel_fb = "rebuilt", None
+        for name, buf in fb.named_buffers():
+            if buf.ndim == 2:
+                mf = buf.detach().float()
+                if mf.shape == (n_freqs, self.n_mels): mf = mf.T
+                if mf.shape == (self.n_mels, n_freqs):
+                    mel_fb = mf.to(device)
+                    mel_src = f"buffer '{name}'"
+                    break
+        if mel_fb is None:
+            mel_fb = Phi4MultimodalSurrogate._make_fbank(
+                torch, np, self.n_mels, self.n_fft, self.sr, device)
+        self._mel_fb = mel_fb
+
+        print(f"[CanaryQwenFrontEnd] n_fft={self.n_fft} win={self.win_length} "
+              f"hop={self.hop} n_mels={self.n_mels} preemph={self._preemph} "
+              f"log_guard={self._log_guard:.2e} normalize=per_feature "
+              f"mel_fb={tuple(self._mel_fb.shape)} src={mel_src}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Differentiable feature extraction
+    # ------------------------------------------------------------------
+
+    def _diff_feats(self, wav):
+        """Differentiable NeMo FilterbankFeatures clone.
+
+        Replicates the exact pipeline in PyTorch autograd ops:
+          pre-emphasis -> STFT -> power -> mel(128) -> log(add guard)
+          -> per-feature CMVN -> (1, 128, T)
+
+        Note: log_zero_guard_type=add means we ADD the guard before log
+        (not clip), matching NeMo's FilterbankFeatures behaviour exactly.
+        """
+        torch = self.torch
+
+        # 1. Pre-emphasis
+        if self._preemph > 0:
+            wav = torch.cat([wav[:1], wav[1:] - self._preemph * wav[:-1]])
+
+        # 2. STFT with center=True reflect padding (NeMo default, exact_pad=False)
+        pad   = self.n_fft // 2
+        wav_p = torch.nn.functional.pad(
+            wav.unsqueeze(0), (pad, pad), mode='reflect').squeeze(0)
+        stft  = torch.stft(wav_p, self.n_fft, hop_length=self.hop,
+                           window=self._win, return_complex=True,
+                           center=False)             # (n_freqs, T)
+
+        # 3. Power -> mel -> log with additive guard
+        power  = stft.abs() ** 2                    # (257, T)
+        mel    = self._mel_fb.to(stft.dtype) @ power  # (128, T)
+        logmel = torch.log(mel + self._log_guard)   # additive guard, not clip
+
+        # 4. Per-feature CMVN (per mel bin over time)
+        mu     = logmel.mean(dim=-1, keepdim=True)
+        sigma  = logmel.std(dim=-1, keepdim=True)
+        logmel = (logmel - mu) / (sigma + 1e-5)
+
+        return logmel.unsqueeze(0)                  # (1, 128, T)
+
+    # ------------------------------------------------------------------
+    # Alignment diagnostic
+    # ------------------------------------------------------------------
+
+    def verify_alignment(self, wav_np):
+        """Compare _diff_feats against real NeMo preprocessor output."""
+        import numpy as np
+        torch = self.torch
+        fb = self.model.perception.preprocessor.featurizer
+        with torch.no_grad():
+            wav_t   = torch.tensor(wav_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+            lengths = torch.tensor([len(wav_np)], device=self.device)
+            real, _ = fb(wav_t, lengths)            # (1, 128, T)
+            real    = real[0].float().cpu().numpy()
+            wav_d   = torch.tensor(wav_np, dtype=torch.float32, device=self.device)
+            diff    = self._diff_feats(wav_d)[0].float().cpu().numpy()
+        T    = min(real.shape[-1], diff.shape[-1])
+        r, d = real[:, :T], diff[:, :T]
+        cos  = float(np.sum(r * d) / (np.linalg.norm(r) * np.linalg.norm(d) + 1e-12))
+        mae  = float(np.abs(r - d).mean())
+        print(f"[CanaryQwenFrontEnd align] cosine={cos:.5f} MAE={mae:.5f} "
+              f"real={real.shape} diff={diff.shape} "
+              f"{'OK' if cos > 0.95 else 'CHECK pipeline'}", flush=True)
+        return cos, mae
+
+    # ------------------------------------------------------------------
+    # Surrogate interface
+    # ------------------------------------------------------------------
+
+    def _get_prompt_ids(self):
+        if self._prompt_ids is None:
+            ids = self.model.tokenizer.text_to_ids(self.PROMPT)
+            self._prompt_ids = torch.tensor(ids, device=self.device, dtype=torch.long)
+        return self._prompt_ids
+
+    def loss_grad(self, waveform, target_text):
+        torch = self.torch
+        wav = torch.tensor(waveform, dtype=torch.float32,
+                           device=self.device, requires_grad=True)
+
+        # 1. Differentiable features -> perception -> audio embeddings
+        diff     = self._diff_feats(wav).to(self._llm_dtype)   # (1, 128, T)
+        feat_len = torch.tensor([diff.shape[-1]], device=self.device)
+        audio_out    = self.model.perception(processed_signal=diff,
+                                             processed_signal_length=feat_len)
+        audio_embeds = audio_out[0]                             # (1, T_audio, d)
+
+        # 2. Splice: [pre-audio prompt] + [audio embeds] + [post-audio] + [response]
+        prompt_ids = self._get_prompt_ids()
+        ph_pos     = (prompt_ids == self.AUDIO_PLACEHOLDER_ID).nonzero(as_tuple=True)[0]
+        pre_ids    = prompt_ids[:ph_pos[0]]
+        post_ids   = prompt_ids[ph_pos[0]+1:]
+        resp_ids   = torch.tensor(
+            self.model.tokenizer.text_to_ids(target_text),
+            device=self.device, dtype=torch.long)
+
+        E            = self.model.embed_tokens
+        input_embeds = torch.cat([
+            E(pre_ids.unsqueeze(0)),
+            audio_embeds,
+            E(post_ids.unsqueeze(0)),
+            E(resp_ids.unsqueeze(0)),
+        ], dim=1)
+
+        # 3. Labels: -100 everywhere except response
+        L      = input_embeds.shape[1]
+        labels = torch.full((1, L), -100, dtype=torch.long, device=self.device)
+        labels[:, -len(resp_ids):] = resp_ids
+
+        # 4. Forward: PeftModelForCausalLM supports standard HF inputs_embeds + labels
+        out  = self.model.llm(inputs_embeds=input_embeds, labels=labels)
+        out.loss.backward()
+
+        loss_val = float(out.loss.item())
+        grad_val = wav.grad.detach().cpu().numpy()
+        del out, input_embeds, audio_embeds, diff, wav
+        torch.cuda.empty_cache()
+        return loss_val, grad_val
+
+    def decode_teacher_forced(self, waveform, target_text):
+        torch = self.torch
+        with torch.no_grad():
+            wav      = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            diff     = self._diff_feats(wav).to(self._llm_dtype)
+            feat_len = torch.tensor([diff.shape[-1]], device=self.device)
+            audio_embeds = self.model.perception(
+                processed_signal=diff,
+                processed_signal_length=feat_len)[0]
+            prompt_ids = self._get_prompt_ids()
+            ph_pos     = (prompt_ids == self.AUDIO_PLACEHOLDER_ID).nonzero(as_tuple=True)[0]
+            pre_ids    = prompt_ids[:ph_pos[0]]
+            post_ids   = prompt_ids[ph_pos[0]+1:]
+            resp_ids   = torch.tensor(
+                self.model.tokenizer.text_to_ids(target_text),
+                device=self.device, dtype=torch.long)
+            E = self.model.embed_tokens
+            input_embeds = torch.cat([
+                E(pre_ids.unsqueeze(0)),
+                audio_embeds,
+                E(post_ids.unsqueeze(0)),
+                E(resp_ids.unsqueeze(0)),
+            ], dim=1)
+            logits = self.model.llm(inputs_embeds=input_embeds).logits[0]
+            n = len(resp_ids)
+            return self.model.tokenizer.ids_to_text(
+                logits[-n-1:-1].argmax(-1).tolist())
+
+
 # ============================================================================
 # 2. Numpy stand-in: verifies an audio-LLM-SHAPED surrogate composes with ZQ
 # ============================================================================
