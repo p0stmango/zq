@@ -572,21 +572,18 @@ def _match_frames(diff, ref):
 
 
 class GraniteSpeechSurrogate(WhiteBoxSurrogate):
-    """IBM Granite-Speech-3.3 -- 16 conformer blocks + Q-former projector + Granite
-    3.3 LLM. Encoder diversity: convolutional conformer front-end vs Whisper-family.
+    """IBM Granite-Speech-3.3 -- conformer encoder + Q-former projector + Granite LLM.
 
-    Previous versions used a straight-through estimator (STE) which fed the
-    optimizer a gradient with ~50% sign errors (mel tiled as mel||mel instead of
-    mel||delta, then normalization mismatch) -- Granite's loss plateaued at random-
-    chance level and its updates poisoned the shared delta. This version replaces
-    the STE with a fully differentiable PyTorch reimplementation of Granite's
-    MelFilterBankFeatureExtractor, derived from the extractor's own stored params
-    at __init__ time (mel filterbank, pre-emphasis, norm scheme, frame config).
-    Granite now contributes real gradients and is a genuine ensemble participant.
+    The feature pipeline (from GraniteSpeechFeatureExtractor source) is NOT what
+    any prior version of this surrogate implemented:
+      - No pre-emphasis
+      - No CMVN / delta features
+      - torchaudio MelSpectrogram(n_fft=512, win_length=400, hop_length=160, n_mels=80)
+      - log10(clip(mel, 1e-10)), then Whisper-style norm: max(x, global_max-8)/4+1
+      - Frame-stack by 2: (T, 80) -> (T//2, 160)  [NOT mel+delta]
 
-    For the paper: the STE failure is worth a paragraph -- it shows that conformer
-    surrogates require correct feature-extractor reimplementation to contribute
-    useful gradients, not just matching output dimensionality.
+    The 160-dim output is two consecutive mel frames concatenated, not delta features.
+    This is fully differentiable as reshape(), so no STE is needed.
     """
 
     def __init__(self, model_id="ibm-granite/granite-speech-3.3-8b",
@@ -607,9 +604,9 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                 lm.gradient_checkpointing_enable()
 
         self.processor = GraniteSpeechProcessor.from_pretrained(model_id)
-        self.fe = (getattr(self.processor, "feature_extractor", None)
-                   or getattr(self.processor, "audio_processor", None)
-                   or getattr(self.processor, "audio_feature_extractor", None))
+
+        # Attribute is audio_processor, not feature_extractor
+        self.fe = getattr(self.processor, "audio_processor", None)
         if self.fe is None:
             for a in dir(self.processor):
                 obj = getattr(self.processor, a, None)
@@ -617,167 +614,118 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                     self.fe = obj; break
         if self.fe is None:
             raise RuntimeError(
-                "Could not find Granite's feature extractor. Run: "
-                "print([a for a in dir(processor) if not a.startswith('_')])")
+                "Could not find GraniteSpeechFeatureExtractor. "
+                "Run: print(vars(processor)) to check attribute names.")
 
-        self._init_differentiable_frontend(torch, self.fe, device, sr)
-
-    def _init_differentiable_frontend(self, torch, fe, device, sr):
-        """Extract all parameters from fe and build the differentiable pipeline.
-
-        Reads n_fft, hop, n_mels, pre-emphasis, mel floor, normalization scheme,
-        and the mel filterbank matrix directly from the real extractor object.
-        Falls back to Granite defaults (Kaldi/ESPnet lineage) where attributes
-        aren't present.
-        """
-        import numpy as np
-
-        # Frame parameters (MelFilterBankFeatureExtractor stores these in ms)
-        if hasattr(fe, 'n_fft'):
-            self.n_fft = int(fe.n_fft)
-            self.hop   = int(getattr(fe, 'hop_length', 160))
-        elif hasattr(fe, 'frame_length'):
-            self.n_fft = int(round(float(fe.frame_length) * sr / 1000))
-            self.hop   = int(round(float(getattr(fe, 'frame_shift', 10)) * sr / 1000))
-        else:
-            self.n_fft, self.hop = 400, 160          # 25 ms / 10 ms @ 16 kHz
-
-        self.n_mels = int(getattr(fe, 'num_mel_bins', getattr(fe, 'n_mels', 80)))
-        self._win   = torch.hann_window(self.n_fft, device=device)
-
-        # Kaldi-lineage extractors floor at 1.0 before log; Whisper uses 1e-10.
-        self._mel_floor    = float(getattr(fe, 'mel_floor', 1.0))
-        self._pre_emphasis = float(getattr(fe, 'pre_emphasis', 0.97))
-        self._do_normalize = bool(getattr(fe, 'do_normalize', True))
-        # 'per_feature' = per-mel-bin CMVN (standard for conformer ASR)
-        self._norm = getattr(fe, 'norm', None)
-
-        # Mel filterbank: use the extractor's own matrix for exact alignment
-        n_freqs = self.n_fft // 2 + 1
-        mel_src = "rebuilt"
-        if hasattr(fe, 'mel_filters') and fe.mel_filters is not None:
-            mf = np.asarray(fe.mel_filters)
-            if mf.ndim == 2:
-                if   mf.shape == (n_freqs, self.n_mels): mf = mf.T
-                elif mf.shape == (self.n_mels, n_freqs):  pass
-                else: mf = None
-            if mf is not None:
-                self._mel_fb = torch.tensor(mf, dtype=torch.float32, device=device)
-                mel_src = "from extractor"
-            else:
-                self._mel_fb = Phi4MultimodalSurrogate._make_fbank(
-                    torch, np, self.n_mels, self.n_fft, sr, device)
-        else:
-            self._mel_fb = Phi4MultimodalSurrogate._make_fbank(
-                torch, np, self.n_mels, self.n_fft, sr, device)
-
-        # Delta kernel: standard N=2 regression formula
-        #   delta[t] = (-2*f[t-2] - f[t-1] + f[t+1] + 2*f[t+2]) / 10
-        self._delta_k = torch.tensor(
-            [-2., -1., 0., 1., 2.], device=device, dtype=torch.float32) / 10.0
-
-        print(f"[GraniteFrontEnd] n_fft={self.n_fft} hop={self.hop} "
-              f"n_mels={self.n_mels} n_out={2*self.n_mels} "
-              f"pre_emph={self._pre_emphasis} mel_floor={self._mel_floor} "
-              f"norm={self._norm!r} do_normalize={self._do_normalize} "
-              f"mel_fb={mel_src}", flush=True)
+        self._init_differentiable_frontend(torch, self.fe, device)
 
     # ------------------------------------------------------------------
-    # Core differentiable frontend
+    # Build differentiable frontend from the real extractor's params
+    # ------------------------------------------------------------------
+
+    def _init_differentiable_frontend(self, torch, fe, device):
+        """Read params directly from the torchaudio MelSpectrogram transform stored
+        on the feature extractor (fe.mel_filters), then build the PyTorch components
+        we need for the differentiable forward.
+        """
+        mel_transform = fe.mel_filters  # torchaudio.transforms.MelSpectrogram
+
+        # STFT params -- read from the nested Spectrogram transform
+        spec = mel_transform.spectrogram
+        self.n_fft      = int(getattr(spec, 'n_fft',      512))
+        self.hop        = int(getattr(spec, 'hop_length',  160))
+        self.win_length = int(getattr(spec, 'win_length',  400))
+        self.n_mels     = int(fe.feature_size)   # 80
+
+        # Window: hann(win_length) zero-padded to n_fft, matching torchaudio internals
+        hann = torch.hann_window(self.win_length, device=device)
+        self._win = torch.zeros(self.n_fft, device=device)
+        self._win[:self.win_length] = hann
+
+        # Mel filterbank: torchaudio stores it as fb with shape (n_freqs, n_mels).
+        # Transpose to (n_mels, n_freqs) for the matmul in _diff_feats.
+        self._mel_fb = mel_transform.mel_scale.fb.detach().T.contiguous().to(device)
+
+        print(f"[GraniteFrontEnd] n_fft={self.n_fft} win_length={self.win_length} "
+              f"hop={self.hop} n_mels={self.n_mels} -> {2*self.n_mels} "
+              f"pipeline=log10+whisper_norm+frame_stack_x2 "
+              f"mel_fb={tuple(self._mel_fb.shape)}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Differentiable feature extraction
     # ------------------------------------------------------------------
 
     def _diff_feats(self, wav):
-        """Fully differentiable reimplementation of MelFilterBankFeatureExtractor.
+        """Fully differentiable clone of GraniteSpeechFeatureExtractor._extract_mel_spectrograms.
 
-        Implements the same pipeline in differentiable PyTorch ops:
-            pre-emphasis -> STFT -> power -> mel fb -> log
-            -> per-feature CMVN -> delta(N=2) -> cat[mel, delta]
+        Every op is a PyTorch autograd primitive, so gradients flow cleanly from
+        the CE loss back to the waveform without any straight-through approximation.
 
-        Returns (1, T, 2*n_mels) matching input_features shape.
+        The 160-dim feature is TWO consecutive mel frames concatenated (frame
+        stacking), NOT mel+delta. The reshape at the end is the differentiable
+        frame-stack -- its gradient is just an unreshape.
         """
         torch = self.torch
 
-        # 1. Pre-emphasis: y[t] = x[t] - alpha * x[t-1]
-        if self._pre_emphasis > 0:
-            wav = torch.cat([wav[:1],
-                             wav[1:] - self._pre_emphasis * wav[:-1]])
+        # 1. center=True reflect padding (matches torchaudio MelSpectrogram default)
+        pad = self.n_fft // 2
+        wav_p = torch.nn.functional.pad(
+            wav.unsqueeze(0), (pad, pad), mode='reflect').squeeze(0)
 
-        # 2. STFT. center=False matches HTK/Kaldi framing (Granite lineage).
-        stft = torch.stft(wav, self.n_fft, hop_length=self.hop,
+        # 2. STFT with zero-padded hann window (win_length=400 zero-padded to n_fft=512)
+        stft = torch.stft(wav_p, self.n_fft, hop_length=self.hop,
                           window=self._win, return_complex=True,
-                          center=False)               # (n_freqs, T)
+                          center=False)             # (n_freqs, T)
 
-        # 3. Power spectrum -> mel filterbank -> log
-        power   = stft.abs() ** 2                    # (n_freqs, T)
-        mel     = self._mel_fb @ power               # (n_mels, T)
-        log_mel = torch.log(
-            torch.clamp(mel, min=self._mel_floor)).t()  # (T, n_mels)
+        # 3. Power spectrum -> mel filterbank -> log10
+        power  = stft.abs() ** 2                   # (n_freqs, T)
+        mel    = self._mel_fb @ power              # (n_mels, T)
+        logmel = torch.log10(
+            torch.clamp(mel, min=1e-10)).t()       # (T, n_mels)
 
-        # 4. Normalisation: per-feature CMVN (standard for conformer ASR)
-        if self._do_normalize:
-            if self._norm == 'per_feature' or self._norm is None:
-                mu    = log_mel.mean(dim=0, keepdim=True)
-                sigma = log_mel.std(dim=0, keepdim=True)
-                log_mel = (log_mel - mu) / (sigma + 1e-5)
-            else:                                    # 'utterance' / global
-                log_mel = ((log_mel - log_mel.mean())
-                           / (log_mel.std() + 1e-5))
+        # 4. Whisper-style normalization (global max, then /4 +1)
+        mx     = logmel.amax(dim=(-2, -1), keepdim=True)
+        logmel = torch.maximum(logmel, mx - 8.0).div(4).add(1)
 
-        # 5. Delta features via differentiable depthwise conv1d
-        k    = self._delta_k.to(log_mel.dtype)
-        lm_t = log_mel.t().unsqueeze(0)             # (1, n_mels, T)
-        delta = torch.nn.functional.conv1d(
-            lm_t,
-            k.view(1, 1, -1).expand(self.n_mels, -1, -1),
-            padding=2, groups=self.n_mels
-        ).squeeze(0).t()                             # (T, n_mels)
+        # 5. Drop last frame if T is odd (matches extractor exactly)
+        if logmel.shape[0] % 2 == 1:
+            logmel = logmel[:-1]
 
-        # 6. Concatenate mel || delta -> (1, T, 2*n_mels) = (1, T, 160)
-        return torch.cat([log_mel, delta], dim=-1).unsqueeze(0)
+        # 6. Frame-stack by 2: (T, 80) -> (T//2, 160)
+        #    This is what produces the 160-dim output -- NOT delta features.
+        T     = logmel.shape[0]
+        feats = logmel.reshape(T // 2, 2 * self.n_mels)
+
+        return feats.unsqueeze(0)                  # (1, T//2, 160)
 
     # ------------------------------------------------------------------
     # Alignment diagnostic
     # ------------------------------------------------------------------
 
     def verify_alignment(self, wav_np):
-        """Compare _diff_feats against the real extractor output.
+        """Compare _diff_feats output against the real extractor frame by frame.
 
-        Run this once on the carrier before the full optimization to confirm
-        the differentiable pipeline is well-calibrated. Cosine > 0.95 means
-        the gradient direction is reliable. If lower, the printed GraniteFrontEnd
-        params will tell you which assumption is wrong -- the most common culprits
-        are mel_floor (1.0 vs 1e-10), pre_emphasis (0.97 vs 0.0), and center
-        (False vs True in the STFT).
+        Cosine similarity > 0.99 is expected once the pipeline is correct, since
+        this is not an approximation -- it reimplements the same ops. If lower,
+        the printed params above will point to the mismatch.
         """
         import numpy as np
         torch = self.torch
 
-        # Real features (non-differentiable, comparison only)
         out  = self.fe(wav_np, device=self.device)
-        key  = "input_features" if "input_features" in out else list(out.keys())[0]
-        real = out[key]
-        if not hasattr(real, "to"):
-            real = torch.as_tensor(real)
-        real = real[0].float().cpu().numpy()         # (T, 160)
+        real = out["input_features"][0].float().cpu().numpy()   # (T//2, 160)
 
         with torch.no_grad():
             wav  = torch.tensor(wav_np, dtype=torch.float32, device=self.device)
-            diff = self._diff_feats(wav)[0].float().cpu().numpy()  # (T, 160)
+            diff = self._diff_feats(wav)[0].float().cpu().numpy()  # (T//2, 160)
 
-        T = min(diff.shape[0], real.shape[0])        # center vs no-center may differ by a few frames
-        diff, real = diff[:T], real[:T]
-
-        cos = float(np.sum(diff * real) /
-                    (np.linalg.norm(diff) * np.linalg.norm(real) + 1e-12))
-        mae = float(np.abs(diff - real).mean())
-        if cos > 0.95:
-            status = "GOOD -- gradient direction reliable"
-        elif cos > 0.80:
-            status = "ACCEPTABLE -- minor mismatch, gradient directionally correct"
-        else:
-            status = "CHECK mel_floor / pre_emphasis / center param"
-        print(f"[GraniteFrontEnd align] cosine={cos:.4f}  MAE={mae:.4f}  {status}",
-              flush=True)
+        T = min(diff.shape[0], real.shape[0])
+        d, r = diff[:T], real[:T]
+        cos = float(np.sum(d * r) / (np.linalg.norm(d) * np.linalg.norm(r) + 1e-12))
+        mae = float(np.abs(d - r).mean())
+        print(f"[GraniteFrontEnd align] cosine={cos:.5f}  MAE={mae:.5f}  "
+              f"diff_shape={diff.shape}  real_shape={real.shape}  "
+              f"{'OK' if cos > 0.98 else 'MISMATCH -- check params above'}", flush=True)
         return cos, mae
 
     # ------------------------------------------------------------------
@@ -785,12 +733,10 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
     # ------------------------------------------------------------------
 
     def _build(self, wav_np, target_text):
-        """Build input_ids with the correct audio placeholder span.
-
-        Granite's Q-former projects any-length conformer output to a fixed number
-        of query tokens, so the placeholder count in input_ids is constant and
-        independent of audio length -- no frame-count coupling between _diff_feats
-        and the processor's output.
+        """Return full processor output (input_ids + audio auxiliary tensors).
+        We replace input_features with the differentiable version in loss_grad,
+        but keep audio_embed_sizes and input_features_mask from the real processor
+        since they're non-differentiable scalars derived from audio length.
         """
         chat = [{"role": "user",
                  "content": "<|audio|>Transcribe the speech into written text."}]
@@ -805,11 +751,16 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                               device=self.device, requires_grad=True)
         wav_np = np.asarray(waveform, dtype=np.float32)
 
-        # Fully differentiable features -- no STE, clean end-to-end gradient
+        # Differentiable features (pure PyTorch, no STE)
         diff = self._diff_feats(wav).to(self.model.dtype)
 
+        # All other inputs from the real processor (input_ids, audio_embed_sizes,
+        # input_features_mask) -- we only replace input_features
         inputs    = self._build(wav_np, target_text)
         input_ids = inputs["input_ids"].to(self.device)
+        extra = {k: v.to(self.device) for k, v in inputs.items()
+                 if k not in ("input_ids", "input_features")}
+
         tok  = self.processor.tokenizer
         resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                             device=self.device).unsqueeze(0)
@@ -817,7 +768,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         labels = torch.full_like(full, -100)
         labels[:, -resp.shape[1]:] = resp
 
-        out = self.model(input_ids=full, input_features=diff, labels=labels)
+        out = self.model(input_ids=full, input_features=diff, labels=labels, **extra)
         out.loss.backward()
 
         loss_val = float(out.loss.item())
@@ -835,14 +786,16 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             diff   = self._diff_feats(wav).to(self.model.dtype)
             inputs = self._build(wav_np, target_text)
             input_ids = inputs["input_ids"].to(self.device)
+            extra = {k: v.to(self.device) for k, v in inputs.items()
+                     if k not in ("input_ids", "input_features")}
             tok  = self.processor.tokenizer
             resp = torch.tensor(tok.encode(target_text, add_special_tokens=False),
                                 device=self.device).unsqueeze(0)
             full   = torch.cat([input_ids, resp], dim=1)
-            logits = self.model(input_ids=full, input_features=diff).logits[0]
+            logits = self.model(input_ids=full, input_features=diff,
+                                **extra).logits[0]
             n = resp.shape[1]
             return tok.decode(logits[-n-1:-1].argmax(-1))
-
 
 # ============================================================================
 # 2. Numpy stand-in: verifies an audio-LLM-SHAPED surrogate composes with ZQ
