@@ -64,7 +64,17 @@ class AudioLLMSurrogate(WhiteBoxSurrogate):
         out = self.model(inputs_embeds=inputs_embeds.unsqueeze(0),
                          labels=labels.unsqueeze(0))
         out.loss.backward()                                 # step 6
-        return float(out.loss.item()), wav.grad.detach().cpu().numpy()
+
+        # --- Memory fix: extract values, free the graph, flush the cache. ----
+        # All three surrogates call loss_grad sequentially; without an explicit
+        # cache flush the allocator accumulates fragmented blocks across calls,
+        # which is what caused the "228 MiB requested, 735 MiB free" OOM.
+        loss_val = float(out.loss.item())
+        grad_val = wav.grad.detach().cpu().numpy()
+        del out, inputs_embeds, tok_embeds, audio_embeds, wav
+        torch.cuda.empty_cache()
+        # ---------------------------------------------------------------------
+        return loss_val, grad_val
 
     def decode_teacher_forced(self, waveform: np.ndarray, target_text: str) -> str:
         """Debug view: what the surrogate predicts at the transcript positions
@@ -295,7 +305,14 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
                          input_features=diff_feats.unsqueeze(0).to(self.model.dtype),
                          labels=labels)
         out.loss.backward()
-        return float(out.loss.item()), wav.grad.detach().cpu().numpy()
+
+        # --- Memory fix -------------------------------------------------------
+        loss_val = float(out.loss.item())
+        grad_val = wav.grad.detach().cpu().numpy()
+        del out, diff_feats, full_ids, labels, resp, wav
+        torch.cuda.empty_cache()
+        # ----------------------------------------------------------------------
+        return loss_val, grad_val
 
     def decode_teacher_forced(self, waveform, target_text):
         torch = self.torch
@@ -393,7 +410,14 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         emb[audio_slice] = audio_embeds
         out = self.thinker(inputs_embeds=emb.unsqueeze(0), labels=labels.unsqueeze(0))
         out.loss.backward()
-        return float(out.loss.item()), wav.grad.detach().cpu().numpy()
+
+        # --- Memory fix -------------------------------------------------------
+        loss_val = float(out.loss.item())
+        grad_val = wav.grad.detach().cpu().numpy()
+        del out, emb, audio_embeds, wav
+        torch.cuda.empty_cache()
+        # ----------------------------------------------------------------------
+        return loss_val, grad_val
 
     def _assemble(self, target_text, n_audio_tokens):
         return self._assemble_chat(self.processor.tokenizer, self.PRE, self.POST,
@@ -565,6 +589,14 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
             model_id, torch_dtype=torch.bfloat16, device_map=device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
+
+        # --- Memory fix: enable gradient checkpointing. -----------------------
+        # Granite was the only surrogate missing this. Without it the conformer
+        # encoder + Granite LLM keeps all intermediate activations resident for
+        # the full backward pass, which on long audio tips the pool over the edge.
+        self.model.gradient_checkpointing_enable()
+        # ----------------------------------------------------------------------
+
         self.processor = GraniteSpeechProcessor.from_pretrained(model_id)
         # GraniteSpeechProcessor may expose its extractor under a different name.
         self.fe = (getattr(self.processor, "feature_extractor", None)
@@ -650,7 +682,14 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         labels = torch.full_like(full, -100); labels[:, -resp.shape[1]:] = resp
         out = self.model(input_ids=full, input_features=diff, labels=labels)
         out.loss.backward()
-        return float(out.loss.item()), wav.grad.detach().cpu().numpy()
+
+        # --- Memory fix -------------------------------------------------------
+        loss_val = float(out.loss.item())
+        grad_val = wav.grad.detach().cpu().numpy()
+        del out, diff, full, labels, resp, wav
+        torch.cuda.empty_cache()
+        # ----------------------------------------------------------------------
+        return loss_val, grad_val
 
     def decode_teacher_forced(self, waveform, target_text):
         torch = self.torch
