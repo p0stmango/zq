@@ -667,13 +667,11 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         return feats.to(self.device)
 
     def _feats_straight_through(self, wav, wav_np):
-        """Real features in value, proxy gradient in backward (straight-through)."""
         torch = self.torch
         real = self._real_feats(wav_np).to(self.model.dtype)     # (1, T, 160)
-        proxy = self._proxy(wav)                                 # (T, 80) differentiable
-        # tile proxy to 160 and match frames so shapes align, then STE:
-        p = torch.cat([proxy, proxy], dim=-1)                    # (T, 160)
-        p = _match_frames(p.unsqueeze(0), real).to(self.model.dtype)
+        proxy = self._proxy(wav)                                 # (T, 160) mel+delta
+        # _proxy now returns (T, 160) directly — no tiling needed
+        p = _match_frames(proxy.unsqueeze(0), real).to(self.model.dtype)
         return real + (p - p.detach())                           # value=real, grad=proxy
 
     def _build(self, wav_np, target_text):
