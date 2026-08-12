@@ -873,14 +873,19 @@ class CanaryQwenSurrogate(WhiteBoxSurrogate):
         self._preemph   = float(fb.preemph)         # 0.97
         self._log_guard = float(fb.log_zero_guard_value)  # 5.96e-8
 
-        # Reuse the featurizer's own window tensor (Hann-400, already on device)
-        self._win = fb.window.detach().to(device).float()
+        # Window: zero-pad win_length (400) to n_fft (512) so torch.stft is happy.
+        # torch.stft requires window.size(0) == n_fft when win_length is not
+        # specified; zero-padding is what NeMo does internally.
+        win_raw   = fb.window.detach().to(device).float()
+        self._win = torch.zeros(self.n_fft, device=device, dtype=torch.float32)
+        self._win[:self.win_length] = win_raw
 
-        # Extract mel filterbank from NeMo's featurizer buffers (2-D buffer)
+        # Extract mel filterbank from NeMo's featurizer buffers.
+        # NeMo registers it as a buffer; name varies by version.
         n_freqs = self.n_fft // 2 + 1              # 257
         mel_src, mel_fb = "rebuilt", None
         for name, buf in fb.named_buffers():
-            if buf.ndim == 2:
+            if buf.ndim == 2 and buf.numel() == n_freqs * self.n_mels:
                 mf = buf.detach().float()
                 if mf.shape == (n_freqs, self.n_mels): mf = mf.T
                 if mf.shape == (self.n_mels, n_freqs):
@@ -888,8 +893,19 @@ class CanaryQwenSurrogate(WhiteBoxSurrogate):
                     mel_src = f"buffer '{name}'"
                     break
         if mel_fb is None:
-            mel_fb = Phi4MultimodalSurrogate._make_fbank(
-                torch, np, self.n_mels, self.n_fft, self.sr, device)
+            # Fall back: build using torchaudio's mel scale to match NeMo
+            try:
+                import torchaudio
+                fb_mat = torchaudio.functional.melscale_fbanks(
+                    n_freqs=n_freqs, f_min=0.0, f_max=self.sr / 2,
+                    n_mels=self.n_mels, sample_rate=self.sr,
+                    norm=None, mel_scale='htk')           # (n_freqs, n_mels)
+                mel_fb  = fb_mat.T.to(device)             # (n_mels, n_freqs)
+                mel_src = "torchaudio melscale_fbanks"
+            except Exception:
+                mel_fb  = Phi4MultimodalSurrogate._make_fbank(
+                    torch, np, self.n_mels, self.n_fft, self.sr, device)
+                mel_src = "rebuilt"
         self._mel_fb = mel_fb
 
         print(f"[CanaryQwenFrontEnd] n_fft={self.n_fft} win={self.win_length} "
