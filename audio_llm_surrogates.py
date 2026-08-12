@@ -943,7 +943,7 @@ class CanaryQwenSurrogate(WhiteBoxSurrogate):
 
         # 3. Power -> mel -> log with additive guard
         power  = stft.abs() ** 2                    # (257, T)
-        mel    = self._mel_fb.to(stft.dtype) @ power  # (128, T)
+        mel    = self._mel_fb.to(power.dtype) @ power  # (128, T)
         logmel = torch.log(mel + self._log_guard)   # additive guard, not clip
 
         # 4. Per-feature CMVN (per mel bin over time)
