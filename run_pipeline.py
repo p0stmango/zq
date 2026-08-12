@@ -173,7 +173,8 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
         import time
         from audio_llm_surrogates import (
             Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate,
-            UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate)
+            UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate,
+            CanaryQwenSurrogate)
 
         def _load(desc, fn):
             print(f"[load] {desc} ...", flush=True)
@@ -195,6 +196,8 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
             "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
         ens.append(_load("Granite-Speech (conformer)", lambda: GraniteSpeechSurrogate(
             "ibm-granite/granite-speech-3.3-8b", device="cuda")))
+        ens.append(_load("Canary-Qwen-2.5B (FastConformer)", lambda: CanaryQwenSurrogate(
+            "nvidia/canary-qwen-2.5b", device="cuda")))
         #ens.append(_load("Phi-4-MM (conformer)", lambda: Phi4MultimodalSurrogate(
         #    "microsoft/Phi-4-multimodal-instruct", device="cuda")))
         return ens
