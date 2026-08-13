@@ -26,7 +26,8 @@ from __future__ import annotations
 # that occurs when there is enough total free memory but no single contiguous
 # block large enough to satisfy the request.
 import os
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.8")
 # -----------------------------------------------------------------------------
 
 import abc
