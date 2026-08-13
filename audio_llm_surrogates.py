@@ -62,7 +62,7 @@ class AudioLLMSurrogate(WhiteBoxSurrogate):
         inputs_embeds[audio_slice] = audio_embeds           # <-- SPLICE (step 4)
 
         out = self.model(inputs_embeds=inputs_embeds.unsqueeze(0),
-                         labels=labels.unsqueeze(0))
+                         labels=labels.unsqueeze(0), use_cache=False)
         out.loss.backward()                                 # step 6
 
         # --- Memory fix: extract values, free the graph, flush the cache. ----
@@ -317,7 +317,7 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
 
         out = self.model(input_ids=full_ids,
                          input_features=diff_feats.unsqueeze(0).to(self.model.dtype),
-                         labels=labels)
+                         labels=labels, use_cache=False)
         out.loss.backward()
 
         loss_val = float(out.loss.item())
@@ -421,7 +421,7 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         input_ids, audio_slice, labels = self._assemble(target_text, audio_embeds.shape[0])
         emb = self.embed_tokens(input_ids).clone()
         emb[audio_slice] = audio_embeds
-        out = self.thinker(inputs_embeds=emb.unsqueeze(0), labels=labels.unsqueeze(0))
+        out = self.thinker(inputs_embeds=emb.unsqueeze(0), labels=labels.unsqueeze(0), use_cache=False)
         out.loss.backward()
 
         # --- Memory fix -------------------------------------------------------
@@ -781,7 +781,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
         labels = torch.full_like(full, -100)
         labels[:, -resp.shape[1]:] = resp
 
-        out = self.model(input_ids=full, input_features=diff, labels=labels, **extra)
+        out = self.model(input_ids=full, input_features=diff, labels=labels, use_cache=False, **extra)
         out.loss.backward()
 
         loss_val = float(out.loss.item())
@@ -845,6 +845,7 @@ class CanaryQwenSurrogate(WhiteBoxSurrogate):
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
 
         self.model = SALM.from_pretrained(model_id).to(device).eval()
+        self.model = self.model.to(torch.bfloat16)  # force bf16; fp32 doubles weight memory
         for p in self.model.parameters():
             p.requires_grad_(False)
 
@@ -1028,7 +1029,7 @@ class CanaryQwenSurrogate(WhiteBoxSurrogate):
         labels[:, -len(resp_ids):] = resp_ids
 
         # 4. Forward: PeftModelForCausalLM supports standard HF inputs_embeds + labels
-        out  = self.model.llm(inputs_embeds=input_embeds, labels=labels)
+        out  = self.model.llm(inputs_embeds=input_embeds, labels=labels, use_cache=False)
         out.loss.backward()
 
         loss_val = float(out.loss.item())
