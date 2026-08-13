@@ -174,8 +174,7 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
         import time
         from audio_llm_surrogates import (
             Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate,
-            UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate,
-            CanaryQwenSurrogate)
+            UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate)
 
         def _load(desc, fn):
             print(f"[load] {desc} ...", flush=True)
@@ -197,13 +196,10 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
             "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
         ens.append(_load("Granite-Speech (conformer)", lambda: GraniteSpeechSurrogate(
             "ibm-granite/granite-speech-3.3-8b", device="cuda")))
-        ens.append(_load("Canary-Qwen-2.5B (FastConformer)", lambda: CanaryQwenSurrogate(
-            "nvidia/canary-qwen-2.5b", device="cuda")))
+        ens.append(_load("Qwen2.5-Omni-7B (Thinker)", lambda: Qwen25OmniSurrogate(
+            "Qwen/Qwen2.5-Omni-7B", device="cuda")))
         #ens.append(_load("Phi-4-MM (conformer)", lambda: Phi4MultimodalSurrogate(
         #    "microsoft/Phi-4-multimodal-instruct", device="cuda")))
-        return ens
-        ens.append(_load("Qwen2.5-Omni-7B", lambda: Qwen25OmniSurrogate(
-            "Qwen/Qwen2.5-Omni-7B", device="cuda")))
         # Ultravox v0.5 remote code is incompatible with transformers 5.x (meta-device
         # init + _init_weights). Re-enable only with a compatible revision= / newer
         # Ultravox, or a transformers downgrade you DON'T want (breaks the others).
