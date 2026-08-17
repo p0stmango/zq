@@ -401,12 +401,12 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
     def _audio_embeds(self, wav):
         torch = self.torch
         mel = self._whisper_log_mel(torch, wav, self.model.dtype)   # (n_mels, T)
-        # Omni's tower transposes+chunks input_features (line ~762: input_features.T
-        # .split(...)), so it wants an UNBATCHED (n_mels, T) mel, not (1, n_mels, T).
-        flen = torch.tensor([mel.shape[-1]], device=self.device)
-        # Omni's chunker does input_features.T.split(...): it wants TIME-MAJOR
-        # (frames, n_mels), so transpose our (n_mels, frames) mel.
-        enc = self.thinker.audio_tower(mel.t(), feature_lens=flen).last_hidden_state
+        # Omni's audio_tower calls input_features.T.split(chunk_lengths) internally,
+        # so it expects (n_mels, T) directly -- no pre-transpose.
+        # feature_lens is the raw frame count T, not a chunk count.
+        T    = mel.shape[-1]
+        flen = torch.tensor([T], device=self.device)
+        enc  = self.thinker.audio_tower(mel, feature_lens=flen).last_hidden_state
         proj = getattr(self.thinker, "audio_projector", None)
         if proj is not None:
             enc = proj(enc)
@@ -862,6 +862,21 @@ class CanaryQwenSurrogate(WhiteBoxSurrogate):
         self._init_differentiable_frontend(torch, fb, device)
         self._prompt_ids = None                         # cached after first call
         self._llm_dtype  = next(self.model.llm.parameters()).dtype
+
+        # Warm up NeMo's JIT-compiled CUDA kernels. FastConformer compiles
+        # custom kernels on first use; triggering this during __init__ makes
+        # the delay visible during loading rather than appearing as a hang
+        # at the start of the first optimization step.
+        print(f"[CanaryQwenFrontEnd] warming up JIT kernels (one-time, may take ~2min)...",
+              flush=True)
+        with torch.no_grad():
+            _wav   = torch.zeros(16000, device=device)
+            _feats = self._diff_feats(_wav).to(self._llm_dtype)
+            _len   = torch.tensor([_feats.shape[-1]], device=device)
+            self.model.perception(processed_signal=_feats,
+                                  processed_signal_length=_len)
+        torch.cuda.empty_cache()
+        print(f"[CanaryQwenFrontEnd] JIT warm-up complete", flush=True)
 
     def _init_differentiable_frontend(self, torch, fb, device):
         """Extract exact params from NeMo's FilterbankFeatures."""
