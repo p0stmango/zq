@@ -192,8 +192,10 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
         ens = []
         ens.append(_load("Qwen2-Audio-7B",  lambda: Qwen2AudioSurrogate(
             "Qwen/Qwen2-Audio-7B-Instruct", device="cuda")))
-        ens.append(_load("Voxtral-Mini-3B", lambda: VoxtralSurrogate(
-            "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
+        # Voxtral dropped: third Whisper-encoder model, least unique given
+        # Qwen2-Audio and Qwen2.5-Omni already cover the Whisper family.
+        # ens.append(_load("Voxtral-Mini-3B", lambda: VoxtralSurrogate(
+        #     "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
         ens.append(_load("Granite-Speech (conformer)", lambda: GraniteSpeechSurrogate(
             "ibm-granite/granite-speech-3.3-8b", device="cuda")))
         ens.append(_load("Qwen2.5-Omni-7B (Thinker)", lambda: Qwen25OmniSurrogate(
