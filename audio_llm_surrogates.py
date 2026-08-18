@@ -140,7 +140,7 @@ class Qwen2AudioSurrogate(AudioLLMSurrogate):
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
 
         self.model = Qwen2AudioForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16).to(device).eval()
+            model_id, dtype=torch.bfloat16).to(device).eval()
         for p in self.model.parameters():                   # grad only on the waveform
             p.requires_grad_(False)
         self.model.gradient_checkpointing_enable()
@@ -269,7 +269,7 @@ class VoxtralSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model_id = model_id
         self.model = VoxtralForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16).to(device).eval()
+            model_id, dtype=torch.bfloat16).to(device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.model.gradient_checkpointing_enable()
@@ -384,12 +384,15 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
         from transformers import Qwen2_5OmniForConditionalGeneration, AutoProcessor
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16).to(device).eval()
+            model_id, dtype=torch.bfloat16).to(device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
         # We only need the Thinker (audio->text); free the Talker if present.
+        # Call empty_cache immediately so the freed Talker weights are returned
+        # to the allocator rather than sitting as unreachable PyTorch memory.
         if hasattr(self.model, "talker"):
             del self.model.talker
+            torch.cuda.empty_cache()
         self.thinker = self.model.thinker
         self.thinker.gradient_checkpointing_enable()
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -460,7 +463,7 @@ class UltravoxSurrogate(AudioLLMSurrogate, _MelFrontEnd):
             _mu._init_weights = True
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = AutoModel.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16,
+            model_id, dtype=torch.bfloat16,
             trust_remote_code=True).to(device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
@@ -508,7 +511,7 @@ class Phi4MultimodalSurrogate(AudioLLMSurrogate):
         from transformers import AutoModelForCausalLM, AutoProcessor
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
+            model_id, dtype=torch.bfloat16, trust_remote_code=True,
             _attn_implementation="eager", device_map=device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
@@ -606,7 +609,7 @@ class GraniteSpeechSurrogate(WhiteBoxSurrogate):
                                   GraniteSpeechProcessor)
         self.torch, self.name, self.device, self.sr = torch, model_id, device, sr
         self.model = GraniteSpeechForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=torch.bfloat16, device_map=device).eval()
+            model_id, dtype=torch.bfloat16, device_map=device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
         try:
