@@ -415,6 +415,24 @@ class Qwen25OmniSurrogate(AudioLLMSurrogate, _MelFrontEnd):
             enc = proj(enc)
         return enc[0] if enc.dim() == 3 else enc                    # (T_a, d)
 
+    def decode_teacher_forced(self, waveform, target_text):
+        # Override base class: route through self.thinker, not self.model.
+        # Qwen2_5OmniForConditionalGeneration (self.model) doesn't support
+        # inputs_embeds; the Thinker submodule does.
+        torch = self.torch
+        with torch.no_grad():
+            wav = torch.tensor(waveform, dtype=torch.float32, device=self.device)
+            audio_embeds = self._audio_embeds(wav)
+            input_ids, audio_slice, labels = self._assemble(
+                target_text, audio_embeds.shape[0])
+            emb = self.embed_tokens(input_ids).clone()
+            emb[audio_slice] = audio_embeds
+            logits = self.thinker(
+                inputs_embeds=emb.unsqueeze(0), use_cache=False).logits[0]
+            resp = (labels != -100).nonzero(as_tuple=True)[0]
+            pred = logits[resp - 1].argmax(-1)
+            return self.processor.tokenizer.decode(pred, skip_special_tokens=True)
+
     def loss_grad(self, waveform, target_text):
         # Same splice/CE as the base, but through the Thinker submodule.
         torch = self.torch
@@ -1083,6 +1101,79 @@ class CanaryQwenSurrogate(WhiteBoxSurrogate):
             n = len(resp_ids)
             return self.model.tokenizer.ids_to_text(
                 logits[-n-1:-1].argmax(-1).tolist())
+
+
+# ============================================================================
+# Offload wrapper: keeps weights in CPU memory, moves to GPU per-call.
+# On GB10 unified memory this is a TLB operation, not a physical data copy.
+# Peak GPU = single largest model + activations regardless of ensemble size.
+# ============================================================================
+
+class OffloadedSurrogate(WhiteBoxSurrogate):
+    """Transparent wrapper enabling large ensembles within a fixed GPU budget.
+
+    All model weights live in CPU (unified) memory between calls. Each
+    loss_grad call moves weights to GPU, runs forward+backward, then moves
+    back. On the GB10 NVLink-C2C unified memory this is fast.
+
+    Usage in build_ensemble:
+        surrogates = [Qwen2AudioSurrogate(...), GraniteSpeechSurrogate(...)]
+        ensemble   = [OffloadedSurrogate(s) for s in surrogates]
+
+    The name attribute is preserved so logging and ZQ reporting work unchanged.
+    """
+
+    # Standalone tensor attributes used by various surrogate classes
+    _TENSOR_ATTRS = [
+        "_window", "_mel_filters",     # _MelFrontEnd (Qwen2Audio, Voxtral, Omni)
+        "_win", "_mel_fb", "_delta_k", # Granite, Canary, Phi4
+    ]
+
+    def __init__(self, surrogate):
+        self._s   = surrogate
+        self.name = surrogate.name
+        # Park weights in CPU memory immediately to free GPU headroom
+        self._move("cpu")
+
+    def _move(self, device):
+        """Move the wrapped surrogate model weights and frontend tensors."""
+        import torch
+        s = self._s
+        s.device = device
+
+        # Move every nn.Module attribute on the surrogate
+        for val in vars(s).values():
+            if isinstance(val, torch.nn.Module):
+                try:
+                    val.to(device)
+                except Exception:
+                    pass
+
+        # Move known standalone tensors (mel filterbanks, STFT windows, etc.)
+        for attr in self._TENSOR_ATTRS:
+            t = getattr(s, attr, None)
+            if t is not None and isinstance(t, torch.Tensor):
+                try:
+                    setattr(s, attr, t.to(device))
+                except Exception:
+                    pass
+
+        if device == "cpu":
+            torch.cuda.empty_cache()
+
+    def loss_grad(self, waveform, target_text):
+        self._move("cuda")
+        try:
+            return self._s.loss_grad(waveform, target_text)
+        finally:
+            self._move("cpu")
+
+    def decode_teacher_forced(self, waveform, target_text):
+        self._move("cuda")
+        try:
+            return self._s.decode_teacher_forced(waveform, target_text)
+        finally:
+            self._move("cpu")
 
 
 # ============================================================================
