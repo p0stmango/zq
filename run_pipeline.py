@@ -174,7 +174,8 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
         import time
         from audio_llm_surrogates import (
             Qwen2AudioSurrogate, VoxtralSurrogate, Qwen25OmniSurrogate,
-            UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate)
+            UltravoxSurrogate, Phi4MultimodalSurrogate, GraniteSpeechSurrogate,
+            OffloadedSurrogate)
 
         def _load(desc, fn):
             print(f"[load] {desc} ...", flush=True)
@@ -189,19 +190,30 @@ def build_ensemble(cfg: PipelineConfig) -> List[WhiteBoxSurrogate]:
         # passes verify. Verify EACH with the debug decode before trusting it:
         # a model that passes verify but decodes garbage (as Voxtral did) is worse
         # than absent, because it injects noise gradients into the shared delta.
+        # OffloadedSurrogate keeps each model in CPU (unified) memory and moves
+        # it to GPU only during loss_grad. On GB10 unified memory this is a
+        # TLB operation, not a physical copy -- enables large ensembles within
+        # a fixed GPU activation budget regardless of total weight count.
+        def _offload(desc, fn):
+            print(f"[load] {desc} ...", flush=True)
+            import time; t = time.time()
+            s = OffloadedSurrogate(fn())   # loads then parks on CPU
+            print(f"[load] {desc} ready ({time.time()-t:.0f}s) [offloaded to CPU]",
+                  flush=True)
+            return s
+
         ens = []
-        ens.append(_load("Qwen2-Audio-7B",  lambda: Qwen2AudioSurrogate(
-            "Qwen/Qwen2-Audio-7B-Instruct", device="cuda")))
-        # Voxtral dropped: third Whisper-encoder model, least unique given
-        # Qwen2-Audio and Qwen2.5-Omni already cover the Whisper family.
-        # ens.append(_load("Voxtral-Mini-3B", lambda: VoxtralSurrogate(
-        #     "mistralai/Voxtral-Mini-3B-2507", device="cuda")))
-        ens.append(_load("Granite-Speech (conformer)", lambda: GraniteSpeechSurrogate(
-            "ibm-granite/granite-speech-3.3-8b", device="cuda")))
-        ens.append(_load("Qwen2.5-Omni-7B (Thinker)", lambda: Qwen25OmniSurrogate(
-            "Qwen/Qwen2.5-Omni-7B", device="cuda")))
-        #ens.append(_load("Phi-4-MM (conformer)", lambda: Phi4MultimodalSurrogate(
-        #    "microsoft/Phi-4-multimodal-instruct", device="cuda")))
+        ens.append(_offload("Qwen2-Audio-7B",
+            lambda: Qwen2AudioSurrogate("Qwen/Qwen2-Audio-7B-Instruct", device="cuda")))
+        ens.append(_offload("Voxtral-Mini-3B",
+            lambda: VoxtralSurrogate("mistralai/Voxtral-Mini-3B-2507", device="cuda")))
+        ens.append(_offload("Granite-Speech (conformer)",
+            lambda: GraniteSpeechSurrogate("ibm-granite/granite-speech-3.3-8b", device="cuda")))
+        ens.append(_offload("Qwen2.5-Omni-7B (Thinker)",
+            lambda: Qwen25OmniSurrogate("Qwen/Qwen2.5-Omni-7B", device="cuda")))
+        # Add more surrogates here freely -- memory cost is O(max single model):
+        # ens.append(_offload("Phi-4-MM", lambda: Phi4MultimodalSurrogate(...)))
+        # ens.append(_offload("Ultravox",  lambda: UltravoxSurrogate(...)))
         # Ultravox v0.5 remote code is incompatible with transformers 5.x (meta-device
         # init + _init_weights). Re-enable only with a compatible revision= / newer
         # Ultravox, or a transformers downgrade you DON'T want (breaks the others).
